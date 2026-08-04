@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""在固定 ShopSimulator benchmark 上评测 OpenAI-compatible 本地或远端模型。"""
+"""在固定 ShopSimulator benchmark 上评测 OpenAI-compatible 本地或远端模型。
+
+阅读这条评测主链时，把它看成一个“两服务、三层数据”的驱动器：
+
+1. 模型服务接收 messages/tools，返回 assistant 文本或一个 tool call；
+2. ShopSimulator 服务接收结构化购物动作，返回 observation、done 和 Reward v3；
+3. ``collect_tasks`` 保存逐题 trajectory，``summarize_trajectories`` 再从原始轨迹
+   计算固定分母指标。这个入口不加载模型权重，也不实现 Agent 循环本身。
+
+关键调用链：
+``main -> load_tasks -> OpenAIChatClient -> collect_tasks ->
+OpenAIChatClient.complete / ShopAgentEnv.step -> summarize_trajectories``。
+"""
 
 import argparse
 import json
@@ -10,6 +22,11 @@ from shopping_grpo.evaluation.rollout import OpenAIChatClient, collect_tasks, lo
 
 
 def parse_args():
+    """定义冻结评测协议中允许从命令行改变的变量。
+
+    公平比较 Base/SFT/GRPO 时，通常只改变正在服务的 checkpoint 和输出目录；
+    temperature、top_p、max_steps、上下文预算应保持一致。
+    """
     parser = argparse.ArgumentParser(description="评测 Base、SFT 或 GRPO Shopping Agent")
     parser.add_argument("--benchmark", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True, help="原始评测轨迹 JSONL")
@@ -43,6 +60,11 @@ def parse_args():
 
 
 def _read_jsonl(path):
+    """重新读取落盘轨迹，而不是复用内存结果。
+
+    这样 summary 总是可以由 ``trajectories.jsonl`` 单独复算；进程中断后再次运行时，
+    ``collect_tasks`` 也能续跑缺失 task，而不会让已完成轨迹消失。
+    """
     path = Path(path)
     if not path.exists():
         return []
@@ -52,13 +74,22 @@ def _read_jsonl(path):
 
 def main():
     args = parse_args()
+
+    # 阶段 0：在发出任何 HTTP 请求前拒绝不可能成立的预算。
+    # 模型可见输入的理论上限是：
+    # context_window - max_tokens - context_safety_margin。
     if args.max_steps < 1:
         raise SystemExit("--max-steps 必须为正数")
     if args.max_tokens < 1:
         raise SystemExit("--max-tokens 必须为正数")
     if args.context_window <= args.max_tokens + args.context_safety_margin:
         raise SystemExit("--context-window 必须大于 --max-tokens 与安全余量之和")
+    # 阶段 1：每个 task 至少携带 task_id；task_id 同时是环境 reset 的主键，也是
+    # 汇总时固定分母的依据。不要用“实际成功写出的轨迹数”充当分母。
     tasks = load_tasks(args.benchmark)
+
+    # 阶段 2：这里只构造 API 客户端。它内部负责 chat template 之外的在线事务：
+    # 消息历史、token 计数、可选上下文压缩，以及调用 /chat/completions。
     client = OpenAIChatClient(
         model=args.model,
         base_url=args.llm_base_url,
@@ -75,6 +106,9 @@ def main():
         observation_generic_token_budget=args.observation_generic_token_budget,
         observation_search_top_k=args.observation_search_top_k,
     )
+    # 阶段 3：真正的 ReAct/tool-use 循环位于 evaluation/rollout.py。
+    # 一道题会反复执行“模型生成 -> 工具校验 -> 环境 step -> observation 入历史”，
+    # 直到 Reward v3 终局、达到 35 步或出现明确错误。
     collect_tasks(
         tasks,
         client=client,
@@ -82,9 +116,12 @@ def main():
         base_url=args.base_url,
         max_steps=args.max_steps,
     )
+    # 阶段 4：从刚落盘的原始 JSONL 重新计算确定性指标。expected task_ids 被显式
+    # 传入，因此缺失、崩溃或未完成的题不会从分母中悄悄消失。
     summary = summarize_trajectories(
         [task["task_id"] for task in tasks], _read_jsonl(args.output)
     )
+    # protocol 与指标一起落盘，回答“这个数字是在什么采样/上下文设置下得到的”。
     summary["protocol"] = {
         "benchmark": str(args.benchmark),
         "model": args.model,

@@ -272,6 +272,11 @@ def _load_preprocessing_components(
 
 
 def _torch_dataset(examples, torch):
+    """把预处理后的 Python list 暴露成 Trainer 需要的逐样本 Dataset。
+
+    此时每个 item 仍是变长的一维 ``[L_i]``；只有进入 ``_collate`` 后才组成
+    ``[B, L_max]``，这样不会在磁盘数据阶段为短轨迹提前填充大量 padding。
+    """
     class TokenizedDataset(torch.utils.data.Dataset):
         def __len__(self):
             return len(examples)
@@ -288,7 +293,12 @@ def _torch_dataset(examples, torch):
 
 
 def _collate(batch, pad_token_id, torch):
-    """右侧 padding，labels 的 padding 永远不参与 loss。"""
+    """右侧 padding，labels 的 padding 永远不参与 loss。
+
+    输入 ``batch`` 含 B 条变长序列 ``[L_i]``；输出三个 ``[B, L_max]`` 张量：
+    ``input_ids`` 用 pad_token_id 补齐，``attention_mask`` 的 padding 为 0，
+    ``labels`` 的 padding 为 -100。于是 batch 内的短样本不会贡献伪造的 pad loss。
+    """
     max_length = max(item["input_ids"].size(0) for item in batch)
     input_ids = torch.full((len(batch), max_length), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((len(batch), max_length), dtype=torch.long)
@@ -302,6 +312,12 @@ def _collate(batch, pad_token_id, torch):
 
 
 def main():
+    """执行 tokenize -> 加载基座并注入 LoRA -> Trainer 优化与保存。
+
+    默认单卡有效 batch size 为
+    ``per_device_train_batch_size * gradient_accumulation_steps = 1 * 8 = 8``。
+    多卡时还需乘以 world size；梯度累积改变更新频率，不改变单次前向的显存峰值。
+    """
     _start_time = _time.time()
     args = parse_args()
     if args.max_length < 1 or args.epochs <= 0:
@@ -356,6 +372,8 @@ def main():
             epoch_time = _time.time() - self.epoch_start if self.epoch_start else 0
             print(f"  EPOCH {int(state.epoch)} 完成  耗时={epoch_time/60:.1f}min")
 
+    # tokenizer 负责 text -> token id；chat_template 负责 messages/tools -> text。
+    # Qwen3.5 上二者分别来自 processor.tokenizer 与 processor，不能混为一个对象。
     tokenizer, chat_template, is_multimodal = _load_preprocessing_components(
         args.model,
         auto_config=AutoConfig,
@@ -419,6 +437,9 @@ def main():
         args,
         prepare_model_for_kbit_training=prepare_model_for_kbit_training,
     )
+    # 对命中的线性层 W 注入低秩更新：W' = W + (alpha / r) * B @ A。
+    # 原始 W 冻结，只训练 rank=r 的 A/B，因此 trainable parameters 远小于全参 SFT。
+    # r=16 控制增量容量，alpha=32 使缩放系数 alpha/r=2。
     model = get_peft_model(
         model,
         LoraConfig(
@@ -443,6 +464,8 @@ def main():
             logdir=str(args.output / "swanlab"),
         )
         print(f"[SwanLab] project={args.swanlab_project} run={run_name}")
+    # Trainer 每做 gradient_accumulation_steps 次前向/反向才 optimizer.step() 一次；
+    # 日志里的 global_step 指参数更新步，不是读取过的 micro-batch 数。
     training_args = TrainingArguments(
         output_dir=str(args.output),
         num_train_epochs=args.epochs,

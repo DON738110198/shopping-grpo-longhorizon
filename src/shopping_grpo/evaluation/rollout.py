@@ -2,6 +2,11 @@
 
 这里负责把模型回复、工具守卫和 ShopSimulator 串成一条可回放记录；它是评测采集
 入口，不负责修改环境仓库或训练模型。
+
+单题状态机可以压缩成：
+``reset -> [LLM complete -> validate tool -> env.step -> append observation]* -> done``。
+其中 ``messages`` 是模型可见历史，``steps`` 是环境实际执行历史；被本地守卫拒绝的
+tool call 只进入 ``blocked_tool_calls``，不消耗环境 step。这个区分对评估效率很重要。
 """
 
 import json
@@ -57,6 +62,11 @@ def rollout_interrupted(signum, frame):
 
 
 class OpenAIChatClient:
+    """最小 OpenAI-compatible 客户端，同时管理“模型看得下多少上下文”。
+
+    ``messages``/``tools`` 是结构化 Python 对象；token 数必须交给正在服务的模型
+    `/tokenize` 端点计算，不能用字符数近似。客户端不保存会话，完整历史由调用者传入。
+    """
     def __init__(
         self,
         model,
@@ -129,7 +139,12 @@ class OpenAIChatClient:
         self.transport = transport
 
     def complete(self, messages, tools):
-        """请求模型下一轮回复，并在上下文超限时按配置压缩历史。"""
+        """请求模型下一轮回复，并在上下文超限时按配置压缩历史。
+
+        输入预算为 ``context_window - max_tokens - safety_margin``。返回值只取
+        ``choices[0].message``，其典型结构是 assistant content 加零个或一个 tool_call。
+        网络错误可重试，但已执行的环境工具绝不会在这里重放。
+        """
         self.last_context_event = None
         self.last_context_tokens = None
         request_messages = messages
@@ -270,7 +285,17 @@ def collect_for_task(
     tools=None,
     attempt_index=0,
 ):
-    """执行一个任务并返回完整轨迹；所有异常都会被写入轨迹后再释放环境。"""
+    """执行一个任务并返回完整轨迹；所有异常都会被写入轨迹后再释放环境。
+
+    三个需要始终分清的对象：
+
+    - ``messages``：发给模型的 system/user/assistant/tool 对话；
+    - ``steps``：真正到达 ShopSimulator 的动作及原始结果；
+    - ``trajectory``：在前两者外再保存 guard、压缩、错误和 release 诊断。
+
+    ``finally`` 中 release 是硬约束：一个任务即使模型服务断开，也不能占着 8 个
+    ShopSimulator slot 中的某一个，影响后续任务。
+    """
     trajectory = {
         "trajectory_id": str(uuid4()),
         "task_id": int(task["task_id"]),
@@ -309,6 +334,8 @@ def collect_for_task(
         consecutive_blocked_calls = 0
         latest_observation_truncated = False
 
+        # 注意循环上限只统计真实环境 steps。非法 tool call 会让模型获得一条纠错
+        # observation，但最多连续允许 3 次，避免用 guard 重试绕过 35 步业务上限。
         while len(trajectory["steps"]) < int(max_steps):
             # 先请求模型，再校验动作；工具结果会追加到 messages，成为下一轮上下文。
             assistant = client.complete(messages, tool_schemas)
@@ -328,6 +355,8 @@ def collect_for_task(
                         **context_event,
                     }
                 )
+            # 多个并行 tool call 都基于同一个旧页面；执行第一个后页面可能已经改变，
+            # 所以只保留第一个，其余调用作为诊断记录，而不是批量点击。
             assistant, dropped_tool_calls = _enforce_serial_tool_call(assistant)
             if dropped_tool_calls:
                 trajectory["tool_call_truncations"].append(
@@ -394,6 +423,8 @@ def collect_for_task(
                 (step.get("projection") or {}).get("truncated")
             )
             messages.append(_tool_message(tool_call, step))
+            # 评测终局完全信任环境返回的 Reward v3。这里不根据文本内容猜测成功，
+            # summary 之后还会要求 gold_purchase + reward_valid=true 才算严格成功。
             if step["done"]:
                 trajectory["status"] = "done"
                 trajectory["terminal_result"] = step["result"]
@@ -449,6 +480,12 @@ def collect_tasks(
     env_factory=ShopAgentEnv,
     attempts_per_task=1,
 ):
+    """按 task/attempt 顺序流式写 JSONL，并安全续跑。
+
+    每完成一条 trajectory 就 append 一行，因此中途退出最多损失当前题。再次运行会
+    从已有 ``(task_id, attempt_index)`` 集合跳过已完成项；基础设施故障则立即停止，
+    防止把服务宕机批量误记成模型失败。
+    """
     attempts_per_task = int(attempts_per_task)
     if attempts_per_task < 1:
         raise ValueError("attempts_per_task must be at least 1")

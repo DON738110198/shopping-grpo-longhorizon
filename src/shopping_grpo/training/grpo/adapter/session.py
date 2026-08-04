@@ -14,7 +14,11 @@ from shopping_grpo.training.grpo.adapter.runtime import current_environment, cur
 
 
 class ShopSimulatorSession:
-    """负责 reset、绑定 coroutine-local 状态，并保证 release。"""
+    """负责 reset、绑定 coroutine-local 状态，并保证 release。
+
+    一个 session 对应一条 rollout，而不是一个 prompt group。同一 task 的 n=4 条
+    rollout 会各自 reset/lease 独立环境，最后由 veRL 按 uid 把奖励重新分组。
+    """
 
     def __init__(
         self,
@@ -76,7 +80,8 @@ class ShopSimulatorSession:
                 if isinstance(initial, dict)
                 else initial
             )
-        # ContextVar 让并发 trajectory 互不串状态，比共享全局 current_env 安全。
+        # ContextVar.set 返回 token；close 时用 token 恢复进入 session 前的值。
+        # 这不是模型 token，而是 Python contextvars 的回滚句柄。
         self._environment_token = current_environment.set(self.env)
         self._state_token = current_runtime_state.set(self.state)
         return self.state

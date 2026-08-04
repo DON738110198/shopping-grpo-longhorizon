@@ -1,16 +1,23 @@
 - name: shopping_tool_agent
+  # veRL 根据 _target_ 动态实例化项目适配器。父类负责生成状态机，子类只接管
+  # ShopSimulator session、observation 投影、上下文护栏与 Reward v3 结算。
   _target_: shopping_grpo.training.grpo.adapter.agent_loop.ShoppingToolAgentLoop
   base_url: ${oc.env:SHOPSIM_BASE_URL,http://127.0.0.1:5700}
   timeout: 60
   max_steps: 35
   required_environment_version: shopsimulator-environment-v2.1
+  # constraint_aware 最终仍以环境提供的 terminal_utility 为学习信号，同时将品牌、
+  # 规格、预算等分解项写进 extra_fields 供监控和 dynamic sampling 使用。
   reward_mode: constraint_aware
+  # 模型窗口 24576 = 最多 16384 输入预算 + 512 本轮生成保留 + 512 安全余量，
+  # 剩余空间用于当前 trajectory 增长；默认不主动压缩历史，超限即标无效。
   context_window_tokens: 24576
   context_generation_reserve_tokens: 512
   context_safety_margin_tokens: 512
   context_input_budget_tokens: 16384
   context_preserve_recent_groups: 1
   context_compaction_enable: false
+  # 搜索页、商品详情页、通用页面采用不同投影预算；投影必须保留当前可执行动作 footer。
   observation_token_budget: 1536
   observation_detail_token_budget: 4096
   observation_generic_token_budget: 768

@@ -1,4 +1,10 @@
-"""veRL 原生工具适配：复用本项目唯一的 ShopSimulator tool schema 与动作守卫。"""
+"""veRL 原生工具适配：复用本项目唯一的 ShopSimulator tool schema 与动作守卫。
+
+每次 execute 的数据路径是：
+``tool name + JSON args -> local action guard -> textual env action -> HTTP step ->
+structured observation -> runtime state``。普通中间 step 的即时 reward 始终为 0；只有
+环境正常终局的 Reward v3 才会在 AgentLoop.run 结束时写成 rollout reward_score。
+"""
 
 from __future__ import annotations
 
@@ -45,7 +51,12 @@ class ShopSimulatorTool(BaseTool):
 
     @rollout_trace_op
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs):
-        """校验、执行一次工具调用，并把公共结果写入 trajectory 状态。"""
+        """校验、执行一次工具调用，并把公共结果写入 trajectory 状态。
+
+        veRL 会为 tools.json 中每个 schema 建一个本类实例，``self.name`` 因而决定
+        当前是 search/open/buy 等哪种工具；实例之间共享的是 coroutine-local state，
+        不是可变全局变量。
+        """
         del instance_id, kwargs
         env = current_environment.get()
         state = current_runtime_state.get()
@@ -69,6 +80,8 @@ class ShopSimulatorTool(BaseTool):
         state["action_attempt_after_truncation_count"] += int(
             bool(state.get("latest_observation_truncated"))
         )
+        # 守卫只看“最新模型可见 observation”。即便 ASIN 曾在历史页出现，当前页没有
+        # 这个按钮也必须拒绝，防止模型凭记忆向已变化的网页发送陈旧动作。
         reason = action_reject_reason(self.name, parameters, observation)
         if reason:
             state["guard_rejection_count"] += 1
@@ -110,6 +123,8 @@ class ShopSimulatorTool(BaseTool):
             )
             return ToolResponse(text=f"Error: ShopSimulator tool execution failed: {exc}"), 0.0, {"error": state["error"]}
         state["consecutive_guard_rejections"] = 0
+        # done 只说明环境声明终局；还需同时验证 over、有限 reward 和 Reward v3 字段，
+        # 才能把这条轨迹当成有效学习样本。
         if step["done"]:
             state["done"] = True
             state["terminate"] = True

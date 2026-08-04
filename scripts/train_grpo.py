@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Run the repository's single supported Shopping Agent GRPO recipe."""
+"""Run the repository's single supported Shopping Agent GRPO recipe.
+
+这个文件是“启动器”，不是 GRPO 算法实现。它做三件事：
+
+1. 验证 SFT merged checkpoint、Parquet 数据和空输出目录；
+2. 把项目路径写入环境变量，让 Hydra YAML 在 Ray worker 中也能解析同一份资源；
+3. 先运行严格 preflight，再 ``python -m verl.trainer.main_ppo``。
+
+真正的批采样/PPO 更新在 veRL 中；本仓库的领域逻辑从 ``configs/agent_loop.yaml``
+进入 ``ShoppingToolAgentLoop``，再调用 ``ShopSimulatorTool``。
+"""
 
 from __future__ import annotations
 
@@ -21,6 +31,7 @@ DEFAULT_VAL_DATA = ROOT / "data/grpo/validation.parquet"
 
 
 def _model_has_weights(path: Path) -> bool:
+    """接受单文件或 Hugging Face 分片索引，但拒绝只有 config 的空壳目录。"""
     candidates = (
         "model.safetensors",
         "model.safetensors.index.json",
@@ -61,6 +72,10 @@ def _validated_path(path: Path, description: str) -> Path:
 
 
 def _hydra_overrides(args: argparse.Namespace) -> list[str]:
+    """把稳定的项目覆盖项与用户在 ``--`` 后传入的 Hydra 覆盖项合并。
+
+    同一列表同时交给 preflight 和 main_ppo，保证“检查的配置”就是“实际训练的配置”。
+    """
     logger_override = (
         "trainer.logger=[console,swanlab]"
         if args.logger == "swanlab"
@@ -77,6 +92,11 @@ def _hydra_overrides(args: argparse.Namespace) -> list[str]:
 
 
 def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
+    """返回 ``(argv, env)``，只构造进程规格，不执行训练。
+
+    这种纯构造函数让 ``--dry-run`` 和单元测试可以验证最终命令，而不导入 CUDA、
+    Ray 或模型权重。``env`` 也显式复制当前环境，避免覆盖代理/CUDA 等调用方设置。
+    """
     model = _validated_path(args.model, "model directory")
     if not model.is_dir() or not (model / "config.json").is_file():
         raise SystemExit(f"model directory is missing config.json: {model}")
@@ -97,6 +117,8 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     if args.logger == "swanlab" and not os.environ.get("SWANLAB_API_KEY"):
         raise SystemExit("--logger swanlab requires SWANLAB_API_KEY")
 
+    # Hydra 配置中的 ${oc.env:...} 以及 Ray 子进程都从这份 environment 取值。
+    # 使用绝对路径是为了让 worker 即使改变 cwd 也读取同一个模型、数据和 manifest。
     environment = dict(os.environ)
     environment.update(
         {
@@ -136,6 +158,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
 def main() -> None:
     args = parse_args()
     command, environment = build_command(args)
+    # 在创建输出目录前打印完整审计信息；dry-run 到这里就结束，绝不会碰 GPU。
     audit = {
         "command": command,
         "model": environment["GRPO_MODEL_PATH"],
@@ -150,6 +173,8 @@ def main() -> None:
     if args.dry_run:
         return
     Path(environment["GRPO_OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
+    # preflight 会校验 Python/CUDA/依赖精确版本、运行文件 SHA、token 内存护栏和
+    # veRL 动态采样补丁。任何一项失败都不会进入 main_ppo。
     preflight = [
         sys.executable,
         str(ROOT / "scripts/check_grpo_runtime.py"),

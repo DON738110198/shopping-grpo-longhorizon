@@ -2,6 +2,11 @@
 
 这个类不重新实现模型生成，而是在三个边界插入项目约束：上下文超长时压缩、工具
 返回后投影 observation、trajectory 结束时计算奖励并释放环境。
+
+父类状态机的大致顺序是 ``GENERATING -> PROCESSING_TOOLS -> GENERATING``，直到
+``TERMINATED``。``agent_data.prompt_ids`` 是当前一条 rollout 的一维 token 序列
+``[T]``；``response_mask`` 和 ``response_logprobs`` 必须与被保留的 response token
+对齐。项目状态通过 ContextVar 按 coroutine 隔离，8 个 worker 不会共享当前页面。
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ from shopping_grpo.training.grpo.adapter.session import ShopSimulatorSession
 
 
 class ShoppingToolAgentLoop(ToolAgentLoop):
-    """Vanilla ToolAgentLoop with deterministic ShopSimulator termination and release."""
+    """在原生 ToolAgentLoop 外包一层确定性的 ShopSimulator 生命周期。"""
 
     def __init__(
         self,
@@ -95,7 +100,12 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         sampling_params,
         ignore_termination=False,
     ):
-        """在每次生成前执行上下文预算检查，并限制本轮最大输出长度。"""
+        """在每次生成前执行上下文预算检查，并限制本轮最大输出长度。
+
+        最大可用输入 ``T_max = context_window - generation_reserve - safety_margin``。
+        若启用压缩，prompt_ids、response_mask、response_logprobs 必须按同一 token 索引
+        同步裁剪，否则 PPO 的旧策略 log-prob 会与错误 token 对齐。
+        """
         runtime_state = current_runtime_state.get()
         current_input_tokens = len(agent_data.prompt_ids)
         if runtime_state is not None:
@@ -165,7 +175,12 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         )
 
     async def _call_tool(self, tool_call, tools_kwargs, agent_data):
-        """把工具适配器拿到的原始 observation 压缩成模型真正可见的版本。"""
+        """把工具适配器拿到的原始 observation 压缩成模型真正可见的版本。
+
+        Tool 先保存 ``_pending_raw_observation``；这里才按当前 tokenizer 计数并投影。
+        原始环境事实留在 runtime 诊断中，``response.text`` 则替换为模型可见版本，
+        因而训练时生成历史和实际 rollout token 完全一致。
+        """
         response, reward, step = await super()._call_tool(
             tool_call,
             tools_kwargs,
@@ -230,7 +245,11 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         return next_state
 
     async def run(self, sampling_params, **kwargs):
-        """启动 session、运行父类 AgentLoop，并在 finally 中释放环境租约。"""
+        """启动 session、运行父类 AgentLoop，并在 finally 中释放环境租约。
+
+        返回的 ``output.reward_score`` 是 veRL 用来计算组内 advantage 的标量；
+        ``output.extra_fields['shopping']`` 不参与反向传播，只提供动态采样过滤和监控。
+        """
         task_id = task_id_from_kwargs(kwargs)
         session = ShopSimulatorSession(
             base_url=self.base_url,
@@ -249,6 +268,7 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             # 父类结束后统一从环境状态结算，避免把中途异常当作正常终局奖励。
             breakdown = reward_breakdown(state)
             output.reward_score = terminal_reward(state, mode=self.reward_mode)
+            # 保留标量/布尔诊断，不把隐藏 goal 或完整商品答案泄漏给训练侧。
             output.extra_fields["shopping"] = {
                 "task_id": task_id,
                 "steps": len(state["steps"]),

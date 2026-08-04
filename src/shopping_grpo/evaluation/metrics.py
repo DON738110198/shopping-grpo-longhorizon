@@ -86,6 +86,7 @@ def _error_type(value: object) -> str:
 
 
 def _strict_success(normalized: Mapping, reward_detail: Mapping) -> bool:
+    """与轻量 summary 共用同一严格语义，只是输入已被标准化。"""
     terminal = normalized.get("terminal")
     terminal = terminal if isinstance(terminal, Mapping) else {}
     return (
@@ -102,7 +103,12 @@ def _strict_success(normalized: Mapping, reward_detail: Mapping) -> bool:
 
 
 def compute_deterministic_metrics(normalized: object) -> dict:
-    """从一条标准化轨迹计算代码拥有的确定性指标。"""
+    """从一条标准化轨迹计算代码拥有的确定性指标。
+
+    输出不是一个混合总分，而是 reward/outcome、动作效率、重复、合法性、上下文
+    和基础设施健康度几个正交分组。后续 LLM rubric 只能补充语义判断，不能覆盖这些
+    可由代码直接验证的事实。
+    """
 
     if not isinstance(normalized, Mapping):
         raise TypeError("normalized trajectory must be an object")

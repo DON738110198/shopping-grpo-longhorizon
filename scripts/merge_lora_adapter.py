@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""把完成 SFT 的 LoRA adapter 合并为 GRPO 的独立起点。"""
+"""把完成 SFT 的 LoRA adapter 合并为 GRPO 的独立起点。
+
+LoRA 训练产物只保存低秩矩阵 A/B。``merge_and_unload`` 将
+``W <- W + (alpha/r) * B @ A`` 写回完整基座权重，并移除 PEFT wrapper。输出因而是
+普通 Hugging Face checkpoint，可被 vLLM 和 veRL 直接加载；这一步不再进行训练。
+"""
 
 from __future__ import annotations
 
@@ -48,6 +53,8 @@ def main():
     model_class = choose_model_class(config, AutoModelForCausalLM, AutoModelForMultimodalLM)
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     print(f"加载 base={args.base_model} model_type={config.model_type} dtype={dtype}")
+    # 合并必须重新加载“与 SFT 完全相同”的 Base。若模型版本不同，即便张量形状碰巧
+    # 一致，LoRA 增量也会加到错误的参数语义上。
     base = model_class.from_pretrained(args.base_model, torch_dtype=dtype, trust_remote_code=True)
     merged = PeftModel.from_pretrained(base, str(args.adapter)).merge_and_unload()
     args.output.mkdir(parents=True, exist_ok=True)

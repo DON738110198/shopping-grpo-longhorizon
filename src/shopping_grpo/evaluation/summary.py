@@ -1,4 +1,8 @@
-"""汇总固定 Shopping Agent 评测集上的确定性指标。"""
+"""汇总固定 Shopping Agent 评测集上的确定性指标。
+
+这是 scripts/evaluate.sh 当前直接使用的轻量汇总器。它只读 trajectory JSONL，
+不请求 LLM Judge；更完整的 rubric/judge 模块在 evaluation/ 下，但不属于这个默认入口。
+"""
 
 from collections import Counter
 
@@ -18,7 +22,12 @@ REWARD_V3_TYPES = (
 
 
 def summarize_trajectories(expected_task_ids, trajectories):
-    """以固定 benchmark 全体 task 为分母汇总严格购物成功率。"""
+    """以固定 benchmark 全体 task 为分母汇总严格购物成功率。
+
+    设 benchmark 任务集合为 E，严格成功集合为 S，则报告 ``|S| / |E|``，而不是
+    ``|S| / completed``。所以崩溃、漏跑和缺失轨迹都会自然计为失败，不能通过少跑
+    难题把成功率抬高。若同一 task 出现多行，这个轻量入口使用最后一行。
+    """
     expected_ids = [int(task_id) for task_id in expected_task_ids]
     expected_set = set(expected_ids)
     by_task = {}
@@ -98,6 +107,7 @@ def summarize_trajectories(expected_task_ids, trajectories):
         (item.get("error") or {}).get("type") == "ContextBudgetError"
         for item in by_task.values()
     )
+    # 固定分母是这份 summary 最重要的可比性契约。
     denominator = len(expected_ids)
     return {
         "expected_tasks": denominator,
@@ -210,6 +220,11 @@ def _reward_detail(trajectory):
 
 
 def _is_strict_success(trajectory):
+    """只有完整且可验证的 Reward v3 gold purchase 才返回 True。
+
+    ``done`` 本身不等于成功：错误购买、主动放弃、循环和 max_steps 都可能正常 done。
+    多层终局标志同时检查，是为了拒绝半写入或协议不完整的 trajectory。
+    """
     terminal = trajectory.get("terminal_result") or {}
     detail = _reward_detail(trajectory)
     return (

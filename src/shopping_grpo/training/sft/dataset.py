@@ -59,12 +59,24 @@ def build_supervised_example(messages, tools, tokenizer, max_length=8192, chat_t
     每个 assistant 回合分别渲染「此前消息 + generation prompt」与「包含该回合的
     消息」，两者的 token 差即为该回合的可训练部分，其中自然包含 tool call。
     任何超长或模板边界不一致样本都会丢弃，不做可能截断工具调用的截断。
+
+    返回的是单样本一维序列，形状均为 ``[L]``，且 ``L <= max_length``：
+
+    - ``input_ids[t]``：第 t 个 token；
+    - ``attention_mask[t]``：真实 token 恒为 1，batch padding 在 collator 中补 0；
+    - ``labels[t]``：assistant token 等于 ``input_ids[t]``，其余位置为 -100。
+
+    Transformers 的交叉熵会忽略 -100，因此目标等价于只最小化 assistant 区间：
+    ``L_sft = -sum_{t in assistant} log p_theta(x_t | x_<t)``。工具 observation
+    仍保留在 input_ids 中作为条件，却不会被模型当成需要模仿的输出。
     """
     # 原始消息保持 OpenAI 格式；只在这里为目标 chat template 做训练期转换。
     template = chat_template or tokenizer
     rendered_messages = normalize_messages_for_chat_template(messages)
     if rendered_messages is None:
         return None
+    # assistant_indices 指向“消息级”位置；稍后还要用 chat template 把它映射成
+    # token 级 [start, end) 区间。一个轨迹可以包含多个 assistant/tool 往返。
     assistant_indices = [
         index
         for index, message in enumerate(rendered_messages)
@@ -74,6 +86,8 @@ def build_supervised_example(messages, tools, tokenizer, max_length=8192, chat_t
         return None
 
     try:
+        # full_text 是这条轨迹最终送入模型的唯一文本版本。先完整渲染，再做区间
+        # 定位，可以保证训练 input 与推理时官方 chat template 的格式完全相同。
         full_text = template.apply_chat_template(
             rendered_messages,
             tools=tools,
@@ -109,6 +123,8 @@ def build_supervised_example(messages, tools, tokenizer, max_length=8192, chat_t
 
         # 部分 chat template 的 generation prompt 与实际 assistant 起始 token 会有
         # 极小差异（例如额外换行）。以公共前缀定位，避免把可用样本误判为损坏。
+        # 例：prefix_ids=[system,user,<assistant-prefix>]，through_assistant_ids 还包含
+        # assistant 内容/tool_call。最长公共前缀之后就是需要监督的第一个 token。
         start = _common_prefix_length(prefix_ids, through_assistant_ids)
         end = len(through_assistant_ids)
         if start >= end or end > len(input_ids):
@@ -127,7 +143,11 @@ def build_supervised_example(messages, tools, tokenizer, max_length=8192, chat_t
 
 
 def load_supervised_examples(path, tokenizer, max_length=8192, chat_template=None):
-    """读取本仓库生成的 SFT JSONL，并报告被模板拒绝的样本数。"""
+    """读取本仓库生成的 SFT JSONL，并报告被模板拒绝的样本数。
+
+    Tokenize 在训练开始前一次完成，返回 ``list[dict]``；这里故意记录 dropped，
+    因为“JSON 能解析”不代表“目标模型模板能无损训练”。
+    """
     try:
         from tqdm import tqdm as _tqdm
     except ImportError:
@@ -161,7 +181,11 @@ def load_supervised_examples(path, tokenizer, max_length=8192, chat_template=Non
 
 
 def split_rows_by_task(rows, validation_ratio=0.05, seed=42):
-    """按 task_id 稳定划分 SFT 行，避免同题轨迹同时出现在训练和验证中。"""
+    """按 task_id 稳定划分 SFT 行，避免同题轨迹同时出现在训练和验证中。
+
+    同一个 task 可能由 teacher 采集出多条 trajectory；若按行随机切分，模型会在
+    validation 中看到训练题的近重复轨迹。这里先对 task_id 做稳定哈希，再整组切分。
+    """
     ratio = float(validation_ratio)
     if not 0 <= ratio < 1:
         raise ValueError("validation_ratio must be in [0, 1)")

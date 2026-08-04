@@ -1,4 +1,9 @@
-"""每条 veRL trajectory 的轻量运行状态；不保存 ShopSimulator 隐藏 goal。"""
+"""每条 veRL trajectory 的轻量运行状态；不保存 ShopSimulator 隐藏 goal。
+
+这里是环境事实到训练信号之间的“防火墙”。只有公开 observation、动作、终局
+Reward v3 和诊断计数能进入 veRL；环境用于判分的隐藏 gold goal 不会写入 state，
+否则模型可能通过训练管线的数据侧信道看到答案。
+"""
 
 from __future__ import annotations
 
@@ -25,7 +30,11 @@ REWARD_V3_TYPES = {
 
 
 def make_runtime_state(task_id: int, max_steps: int) -> dict:
-    """创建只含公共运行诊断的状态，reward 仅在环境正常终局后写入。"""
+    """创建只含公共运行诊断的状态，reward 仅在环境正常终局后写入。
+
+    ``done`` 表示环境终局，``terminate`` 表示 AgentLoop 应停止；二者并不等价。
+    例如上下文超限会 terminate，但不能伪造成一次合法的环境 done。
+    """
     return {
         "task_id": int(task_id),
         "max_steps": int(max_steps),
@@ -110,7 +119,11 @@ def record_action_attempt(state: dict, tool_name: str, parameters: dict, observa
 
 
 def validate_reward(raw_detail: object) -> dict:
-    """Validate and minimize public Environment v2.1 / Reward v3 diagnostics."""
+    """验证并最小化 Environment v2.1 / Reward v3 的公开诊断。
+
+    这里采用 fail-closed：字段缺失、NaN、范围越界或枚举不一致都会让整条 rollout
+    ``sampling_invalid``，而不是用默认值继续训练。返回对象只保留训练/监控需要字段。
+    """
     if not isinstance(raw_detail, Mapping):
         raise ValueError("reward_detail must be an object")
     if raw_detail.get("reward_version") != "shopsimulator-reward-v3":
@@ -215,7 +228,12 @@ def _normal_terminal(state: dict) -> bool:
 
 
 def reward_breakdown(state: dict) -> dict[str, float | bool]:
-    """计算约束感知终局奖励；基础设施无效轨迹只返回诊断，不制造学习信号。"""
+    """计算约束感知终局奖励；基础设施无效轨迹只返回诊断，不制造学习信号。
+
+    当前 ``total`` 不是在训练侧重新加权各维度，而是可信环境终局的
+    ``terminal_utility``。r_type/r_att/r_option/r_price 等是解释性分解指标；不能把
+    某个中间分量误当成 GRPO 实际优化目标。
+    """
     invalid = bool(state.get("infrastructure_invalid"))
     normal_terminal = _normal_terminal(state)
     native = float(state.get("final_reward", 0.0)) if normal_terminal else 0.0

@@ -1,4 +1,9 @@
-"""Pure reward-group selection used by the bounded veRL sampling patch."""
+"""veRL 有界动态采样补丁使用的纯 Python reward-group 选择逻辑。
+
+默认每个 task/prompt 采样 K=4 条轨迹。若组内终局效用全相同，则相对 advantage
+没有排序信息；若任一轨迹基础设施无效或 reward 不可验证，则整组也不能训练。
+本文件只返回保留索引和统计量，真正按索引裁剪 tensor batch 的位置在 veRL 补丁中。
+"""
 
 from __future__ import annotations
 
@@ -182,11 +187,12 @@ def select_reward_varying_groups(
     sampling_invalid_reasons: Sequence[Sequence[str]] | None = None,
     tolerance: float = 1.0e-8,
 ) -> tuple[list[int], dict[str, Any]]:
-    """Return trajectory indices belonging to groups with non-constant reward.
+    """返回 reward 有差异且全部有效的 group 所对应的 trajectory 索引。
 
-    Group order follows the first occurrence of each uid. Returned trajectory
-    indices preserve their original order, so callers can safely apply the same
-    selection to every aligned tensor and non-tensor batch field.
+    对 uid=u 的组，先计算 ``range_u = max(utility_u) - min(utility_u)``。仅当
+    ``range_u > tolerance`` 且组内没有 sampling_invalid 时保留。返回索引保持原始
+    顺序，使调用方能对 input_ids、attention_mask、old_log_probs、rewards 以及
+    extra_fields 使用同一个 selection，避免张量与轨迹诊断错位。
     """
 
     if len(uids) != len(seq_rewards):
@@ -219,6 +225,7 @@ def select_reward_varying_groups(
         if sampling_invalid_reasons is not None
         else [()] * len(uids)
     )
+    # uid 是 prompt/task 的组标识；相同 uid 的 K 条 rollout 必须一起作决定。
     grouped: dict[Hashable, dict[str, Any]] = {}
     for index, (
         uid,
