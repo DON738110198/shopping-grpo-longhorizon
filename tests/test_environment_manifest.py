@@ -1,8 +1,10 @@
-import unittest
+import hashlib
 import json
-from pathlib import Path
 import tempfile
+import unittest
+from pathlib import Path
 
+from scripts.check_grpo_runtime import CURRENT_RUNTIME_FILES
 from shopping_grpo.environment.manifest import (
     MANIFEST_VERSION,
     shopsimulator_source_commit,
@@ -11,6 +13,17 @@ from shopping_grpo.environment.manifest import (
 
 
 class EnvironmentManifestTest(unittest.TestCase):
+    def test_frozen_runtime_hashes_match_embedded_sources(self):
+        root = Path(__file__).resolve().parents[1]
+        manifest = json.loads(
+            (root / "data/environment.json").read_text(encoding="utf-8")
+        )
+
+        for name, relative_path in CURRENT_RUNTIME_FILES.items():
+            source = (root / relative_path).read_bytes().replace(b"\r\n", b"\n")
+            actual = hashlib.sha256(source).hexdigest()
+            self.assertEqual(actual, manifest["runtime_files_sha256"][name], name)
+
     def test_current_environment_contract_is_validated(self):
         manifest = {
             "manifest_version": MANIFEST_VERSION,
