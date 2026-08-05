@@ -69,6 +69,12 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("SHOPSIM_BASE_URL", "http://127.0.0.1:5700"),
     )
     parser.add_argument(
+        "--shop-timeout",
+        type=int,
+        default=60,
+        help="ShopSimulator HTTP timeout in seconds (separate from the Teacher timeout).",
+    )
+    parser.add_argument(
         "--model",
         default=os.environ.get("OPENAI_MODEL", "deepseek-v4-flash"),
     )
@@ -100,6 +106,7 @@ def collect_until_target(
     output_path,
     base_url,
     max_steps,
+    shop_timeout=60,
     attempts_per_task,
     workers=1,
     excluded_task_ids=(),
@@ -135,6 +142,7 @@ def collect_until_target(
                 task,
                 client=client_factory() if client_factory else client,
                 base_url=base_url,
+                env_timeout=shop_timeout,
                 max_steps=max_steps,
                 attempt_index=attempt_index,
             )
@@ -187,6 +195,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--attempts-per-task must be at least 1")
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
+    if args.shop_timeout < 1:
+        raise SystemExit("--shop-timeout must be at least 1")
     if args.workers > 1 and args.target_accepted is None:
         raise SystemExit("--workers > 1 requires --target-accepted")
     if not 0 <= args.validation_ratio < 1:
@@ -229,6 +239,7 @@ def _collection_config(args: argparse.Namespace) -> dict:
         "model": args.model,
         "llm_base_url": args.llm_base_url,
         "shopsim_base_url": args.base_url,
+        "shopsim_timeout": args.shop_timeout,
         "limit": args.limit,
         "target_accepted": args.target_accepted,
         "attempts_per_task": args.attempts_per_task,
@@ -277,6 +288,7 @@ def main() -> int:
                     client=client,
                     output_path=paths["raw"],
                     base_url=args.base_url,
+                    env_timeout=args.shop_timeout,
                     max_steps=args.max_steps,
                     attempts_per_task=args.attempts_per_task,
                 )
@@ -289,6 +301,7 @@ def main() -> int:
                     client_factory=lambda: _make_client(args),
                     output_path=paths["raw"],
                     base_url=args.base_url,
+                    shop_timeout=args.shop_timeout,
                     max_steps=args.max_steps,
                     attempts_per_task=args.attempts_per_task,
                     workers=args.workers,

@@ -20,6 +20,7 @@ class CollectSftDataCliTests(unittest.TestCase):
 
         self.assertEqual(args.model, "deepseek-v4-flash")
         self.assertEqual(args.base_url, "http://127.0.0.1:5700")
+        self.assertEqual(args.shop_timeout, 60)
         self.assertEqual(args.max_steps, 35)
         self.assertEqual(args.output_dir, Path("outputs/sft-collection"))
 
@@ -60,6 +61,7 @@ class CollectSftDataCliTests(unittest.TestCase):
                 client=object(),
                 output_path=Path(tmpdir) / "raw.jsonl",
                 base_url="http://shop.test",
+                shop_timeout=180,
                 max_steps=35,
                 attempts_per_task=1,
                 workers=1,
@@ -68,6 +70,7 @@ class CollectSftDataCliTests(unittest.TestCase):
         self.assertEqual([row["trajectory_id"] for row in written], ["one", "two"])
         self.assertEqual(accepted, 2)
         self.assertEqual(collect.call_count, 2)
+        self.assertEqual(collect.call_args.kwargs["env_timeout"], 180)
 
     def test_accepted_target_ignores_held_out_rows_already_in_raw(self):
         with tempfile.TemporaryDirectory() as tmpdir:

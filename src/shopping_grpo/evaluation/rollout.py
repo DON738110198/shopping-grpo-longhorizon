@@ -281,6 +281,7 @@ def collect_for_task(
     client,
     env_factory=ShopAgentEnv,
     base_url="http://127.0.0.1:5700",
+    env_timeout=60,
     max_steps=30,
     tools=None,
     attempt_index=0,
@@ -315,7 +316,7 @@ def collect_for_task(
         "error": None,
         "release_error": None,
     }
-    env = env_factory(base_url=base_url)
+    env = env_factory(base_url=base_url, timeout=env_timeout)
     try:
         # reset 建立任务状态；后续每一轮只允许一个工具调用。
         initial = env.reset(task["task_id"])
@@ -476,6 +477,7 @@ def collect_tasks(
     client,
     output_path,
     base_url,
+    env_timeout=60,
     max_steps=30,
     env_factory=ShopAgentEnv,
     attempts_per_task=1,
@@ -501,6 +503,7 @@ def collect_tasks(
                 client=client,
                 env_factory=env_factory,
                 base_url=base_url,
+                env_timeout=env_timeout,
                 max_steps=max_steps,
                 attempt_index=attempt_index,
             )
