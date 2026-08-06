@@ -9,8 +9,8 @@ trajectories, not historical failed collection attempts.
 
 ## How the dataset was produced
 
-The final collection used ShopSimulator Environment v2.1, Reward v3 and
-`deepseek-v4-flash` as the teacher. Seven batches produced 604 raw trajectories.
+The promoted collection used ShopSimulator Environment v2.1, Reward v3 and
+`deepseek-v4-flash` as the teacher. One four-worker run produced 616 raw trajectories.
 Every trajectory executed its actions in ShopSimulator during collection. The
 saved result was accepted only when Environment v2.1 returned a valid Reward v3
 gold purchase; no second model judged whether the trajectory succeeded.
@@ -19,32 +19,33 @@ Collection audit:
 
 | Item | Value |
 |---|---:|
-| Raw trajectories | 604 |
-| Unique task IDs | 604 |
+| Raw trajectories | 616 |
+| Unique task IDs | 616 |
 | Accepted gold trajectories | 428 |
-| Acceptance rate | 70.9% |
-| Mean raw reward | 0.6121 |
-| Mean steps | 11.3 |
-| Guard violations | 0 |
-| HTTP 400 responses | 0 |
-| Collection errors | 4 |
+| Acceptance rate | 69.5% |
+| Mean steps | 11.64 |
+| Guard-rejected calls in raw audit | 327 |
+| Multi-call truncations in raw audit | 28 |
+| HTTP 400 responses | 2 |
+| Collection errors | 2 |
 
-The 428 accepted trajectories were split into 379 training and 49 validation
-rows. Assistant reasoning was removed; the SFT target contains only the
-observable action protocol. This keeps the training contract aligned with what
-the environment can verify.
+The 428 accepted trajectories were split into 385 training and 43 validation
+rows. Guard-rejected calls and their synthetic guard observations were removed
+from the SFT rows, as were private reasoning fields and terminal reward details.
+The accepted task IDs do not overlap the frozen evaluation set. They were drawn
+from `data/grpo/train.jsonl`, so all 428 do overlap the GRPO training task pool.
 
 ## Frozen deliverables
 
 | File | Rows | SHA-256 |
 |---|---:|---|
-| `data/sft/train.jsonl` | 379 | `8cd1f72130b3c781d5ffe08fe3e399b2a9e45d204e3f3bd0d8e677d1b51c8ec5` |
-| `data/sft/validation.jsonl` | 49 | `f8ae506d0fa9d1526342a9f717da24922c8a55776d076a296698abac4fde05b3` |
+| `data/sft/train.jsonl` | 385 | `f9485cf576dd1a40b6cd7d6652d7843b28ac433a83ba00698352671bb5b5a8e2` |
+| `data/sft/validation.jsonl` | 43 | `4f5643fee15a1fd4128310b21acb5b71087f22d9d5576ab1469d59e41f826d53` |
 
 The aggregate raw collection had SHA-256
-`b1db9e41673d285da7164e8352fa0a702f537157792fa137c94f7cf200435fa1`;
+`84c7c92d585bcb6f7ee921064ce06c586a7765d5a110f585c0cdc371510fb947`;
 the accepted aggregate had SHA-256
-`aab4d81f134dfcd40e67611f5a413142e4825d5cb6ea60b697536aec2c88fab7`.
+`c2ae76920574bf0c8a77acaaf170da672435c5388b120740b9f5702cd07435a1`.
 Raw teacher responses are intentionally not part of the beginner repository.
 
 ## Run a new collection

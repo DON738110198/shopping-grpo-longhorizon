@@ -10,8 +10,8 @@ variants and terminate.
 ## Inputs
 
 - Base model: `Qwen/Qwen3.5-2B`
-- Train data: `data/sft/train.jsonl` (379 rows)
-- Validation data: `data/sft/validation.jsonl` (49 rows)
+- Train data: `data/sft/train.jsonl` (385 rows)
+- Validation data: `data/sft/validation.jsonl` (43 rows)
 - Target: assistant tokens only; user and tool-observation tokens are masked
 
 The data provenance and hashes are recorded in
@@ -56,9 +56,10 @@ bash scripts/serve_model.sh outputs/models/sft-merged
 bash scripts/evaluate.sh sft
 ```
 
-The reported checkpoint completed 141 optimizer steps. Its validation loss was
+The upstream reported checkpoint completed 141 optimizer steps. Its validation loss was
 0.3365 after epoch 1, 0.3189 after epoch 2 and 0.3147 after epoch 3. The frozen
 result and reproduction config are in [`experiments/sft/`](../experiments/sft/).
+Those metrics do not describe a new run trained on the promoted 385/43 split.
 
 ## Output contract
 

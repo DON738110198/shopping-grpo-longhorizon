@@ -2,14 +2,27 @@
   "schema_version": "shopping-sft-dataset-v1",
   "environment": "shopsimulator-environment-v2.1",
   "reward": "shopsimulator-reward-v3",
+  "source_collection": {
+    "path": "outputs/sft-collection-dsv4flash-20260805-full-1848",
+    "teacher_model": "deepseek-v4-flash",
+    "raw_trajectories": 616,
+    "accepted_gold_trajectories": 428,
+    "acceptance_rate": 0.6948051948051948,
+    "collection_errors": 2,
+    "task_source": "data/grpo/train.jsonl",
+    "evaluation_overlap": 0,
+    "grpo_train_overlap": 428,
+    "final_audit": "outputs/sft-collection-dsv4flash-20260805-full-1848/final_audit.json",
+    "final_audit_sha256": "5caf409a286c18f1853a8f9c891f04e4f1fa45587c2d13922b73bd19ca9fb430"
+  },
   "train": {
     "path": "data/sft/train.jsonl",
-    "rows": 379,
-    "sha256": "8cd1f72130b3c781d5ffe08fe3e399b2a9e45d204e3f3bd0d8e677d1b51c8ec5"
+    "rows": 385,
+    "sha256": "f9485cf576dd1a40b6cd7d6652d7843b28ac433a83ba00698352671bb5b5a8e2"
   },
   "validation": {
     "path": "data/sft/validation.jsonl",
-    "rows": 49,
-    "sha256": "f8ae506d0fa9d1526342a9f717da24922c8a55776d076a296698abac4fde05b3"
+    "rows": 43,
+    "sha256": "4f5643fee15a1fd4128310b21acb5b71087f22d9d5576ab1469d59e41f826d53"
   }
 }
