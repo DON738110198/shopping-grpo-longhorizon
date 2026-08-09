@@ -219,7 +219,7 @@ def _reward_detail(trajectory):
     return detail if isinstance(detail, dict) else {}
 
 
-def _is_strict_success(trajectory):
+def is_strict_success(trajectory):
     """只有完整且可验证的 Reward v3 gold purchase 才返回 True。
 
     ``done`` 本身不等于成功：错误购买、主动放弃、循环和 max_steps 都可能正常 done。
@@ -238,3 +238,8 @@ def _is_strict_success(trajectory):
         and detail.get("purchase_success") is True
         and detail.get("termination_reason") == "gold_purchase"
     )
+
+
+# Kept for the existing summary implementation while exposing one canonical
+# per-trajectory predicate to paired statistical comparisons.
+_is_strict_success = is_strict_success
