@@ -216,6 +216,7 @@ def select_reward_varying_groups(
     sampling_invalid: Sequence[bool] | None = None,
     sampling_invalid_reasons: Sequence[Sequence[str]] | None = None,
     tolerance: float = 1.0e-8,
+    consistency_tolerance: float = 1.0e-6,
 ) -> tuple[list[int], dict[str, Any]]:
     """返回 reward 有差异且全部有效的 group 所对应的 trajectory 索引。
 
@@ -241,6 +242,11 @@ def select_reward_varying_groups(
             raise ValueError(f"{name} must have the same length as uids")
     if tolerance < 0 or not math.isfinite(tolerance):
         raise ValueError(f"tolerance must be a finite non-negative number, got {tolerance!r}")
+    if consistency_tolerance < 0 or not math.isfinite(consistency_tolerance):
+        raise ValueError(
+            "consistency_tolerance must be a finite non-negative number, "
+            f"got {consistency_tolerance!r}"
+        )
 
     policy_values = policy_rewards if policy_rewards is not None else seq_rewards
     terminal_values = terminal_utilities if terminal_utilities is not None else seq_rewards
@@ -290,7 +296,15 @@ def select_reward_varying_groups(
             raise ValueError(
                 f"policy_reward at index {index} is not finite: {raw_policy_reward!r}"
             )
-        if not math.isclose(reward, metadata_reward, rel_tol=0.0, abs_tol=tolerance):
+        # reward_tensor is float32 while Python metadata is serialized as float64.
+        # Keep this assertion strict enough to catch trajectory misalignment without
+        # treating a single float32 ULP as a different policy reward.
+        if not math.isclose(
+            reward,
+            metadata_reward,
+            rel_tol=0.0,
+            abs_tol=consistency_tolerance,
+        ):
             raise ValueError(
                 f"policy reward mismatch at index {index}: tensor={reward}, metadata={metadata_reward}"
             )

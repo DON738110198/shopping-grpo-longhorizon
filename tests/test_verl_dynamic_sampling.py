@@ -139,6 +139,15 @@ class RewardGroupSelectionTest(unittest.TestCase):
                 policy_rewards=[0.0, 0.1, 0.0, 0.0],
             )
 
+    def test_float32_rounding_is_not_a_policy_reward_mismatch(self):
+        indices, _ = select_reward_varying_groups(
+            ["task", "task"],
+            [0.0, 0.9700000286102295],
+            policy_rewards=[0.0, 0.97],
+        )
+
+        self.assertEqual(indices, [0, 1])
+
     def test_invalid_validity_flag_fails_closed(self):
         info = shopping_info(0.0, invalid=True, invalid_reason="reward_unverifiable")
         info["valid_for_learning"] = True
