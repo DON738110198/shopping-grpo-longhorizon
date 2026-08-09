@@ -199,7 +199,7 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
             self.assertTrue(state["terminate"])
             self.assertEqual(state["terminal_result"], {"done": True, "over": True})
             self.assertTrue(state["infrastructure_invalid"])
-            self.assertIsNone(state["reward_components"])
+            self.assertIsNone(state["reward_detail"])
             self.assertNotIn("hidden", str(state))
 
         asyncio.run(run())
@@ -212,12 +212,32 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
                     "done": True,
                     "over": True,
                     "reward": 0.6,
+                    "termination_reason": "valid_alternative_purchase",
                     "goal": {"secret": True},
                     "reward_detail": {
-                        "r_type": 1,
-                        "r_att": 1,
-                        "r_option": 0.5,
-                        "r_price": 1,
+                        "reward_version": "shopsimulator-reward-v3",
+                        "reward_type": "valid_alternative_purchase",
+                        "reward_valid": True,
+                        "termination_reason": "valid_alternative_purchase",
+                        "target_asin_match": False,
+                        "terminal_utility": 0.6,
+                        "purchase_success": True,
+                        "sampling_invalid": False,
+                        "hard_gates": {
+                            "category": {
+                                "status": "pass",
+                                "passed": True,
+                                "verifiable": True,
+                            }
+                        },
+                        "weighted_score": 0.75,
+                        "evidence_coverage": 0.8,
+                        "dimension_scores": {
+                            "brand": 1.0,
+                            "model": 1.0,
+                            "core_functions": 0.5,
+                            "key_options": 0.5,
+                        },
                         "hidden_answer": "do not retain",
                     },
                 }
@@ -238,8 +258,13 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
             self.assertEqual(response.text, "Environment terminated.")
             self.assertFalse(state["infrastructure_invalid"])
             self.assertEqual(
-                state["reward_components"],
-                {"r_type": 1.0, "r_att": 1.0, "r_option": 0.5, "r_price": 1.0},
+                state["reward_detail"]["dimension_scores"],
+                {
+                    "brand": 1.0,
+                    "model": 1.0,
+                    "core_functions": 0.5,
+                    "key_options": 0.5,
+                },
             )
             self.assertNotIn("hidden", str(state))
 
@@ -256,15 +281,24 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
                     "termination_reason": "reward_unverifiable",
                     "reward_valid": False,
                     "reward_detail": {
-                        "reward_version": "unsupported-reward",
+                        "reward_version": "shopsimulator-reward-v3",
                         "reward_type": "reward_unverifiable",
                         "reward_valid": False,
                         "termination_reason": "reward_unverifiable",
                         "target_asin_match": False,
+                        "terminal_utility": 0.0,
+                        "purchase_success": False,
+                        "sampling_invalid": True,
                         "hard_gates": {
-                            "category": {"passed": True, "verifiable": True}
+                            "category": {
+                                "status": "unverifiable",
+                                "passed": False,
+                                "verifiable": False,
+                            }
                         },
                         "weighted_score": 0.0,
+                        "evidence_coverage": 0.0,
+                        "dimension_scores": {},
                     },
                 }
 

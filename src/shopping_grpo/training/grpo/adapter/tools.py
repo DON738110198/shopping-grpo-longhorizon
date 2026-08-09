@@ -166,7 +166,7 @@ class ShopSimulatorTool(BaseTool):
                             raise ValueError(
                                 "terminal_utility differs from terminal reward"
                             )
-                    except ValueError as exc:
+                    except (TypeError, ValueError) as exc:
                         _mark_infrastructure_invalid(
                             state,
                             f"invalid_terminal_reward_detail:{exc}",
