@@ -90,6 +90,7 @@ class PublicEntrypointTest(unittest.TestCase):
         self.assertEqual(environment["GRPO_MODEL_PATH"], str(model))
         self.assertEqual(environment["GRPO_TRAIN_FILE"], str(train))
         self.assertEqual(environment["GRPO_VAL_FILE"], str(validation))
+        self.assertEqual(environment["VLLM_USE_FLASHINFER_SAMPLER"], "0")
         self.assertIn("trainer.logger=[console]", command)
         self.assertIn("data.seed=42", command)
         self.assertIn("actor_rollout_ref.rollout.engine_kwargs.vllm.seed=42", command)

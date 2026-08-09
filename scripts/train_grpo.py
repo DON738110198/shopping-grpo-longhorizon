@@ -159,6 +159,14 @@ def _write_run_evidence(
         "host": socket.gethostname(),
         "platform": platform.platform(),
         "cuda_visible_devices": environment.get("CUDA_VISIBLE_DEVICES"),
+        "runtime_environment": {
+            key: environment.get(key)
+            for key in (
+                "CUDA_VISIBLE_DEVICES",
+                "VLLM_USE_FLASHINFER_SAMPLER",
+                "CPATH",
+            )
+        },
         "seed": args.seed,
         "experiment_name": args.experiment_name,
         "command": command,
@@ -231,6 +239,11 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
             "SHOPPING_AGENT_LOOP_CONFIG": str(DEFAULT_AGENT_CONFIG),
             "SHOPPING_TOOL_CONFIG": str(DEFAULT_TOOL_CONFIG),
             "GRPO_CONFIG_NAME": config.stem,
+            # This FlashInfer build rejects Blackwell SM 12.x during sampler warmup.
+            # PyTorch sampling remains deterministic under the configured vLLM seed.
+            "VLLM_USE_FLASHINFER_SAMPLER": os.environ.get(
+                "VLLM_USE_FLASHINFER_SAMPLER", "0"
+            ),
         }
     )
     if args.logger == "swanlab":
