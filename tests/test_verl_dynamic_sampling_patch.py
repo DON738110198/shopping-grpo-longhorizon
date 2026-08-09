@@ -20,7 +20,6 @@ from shopping_grpo.training.grpo.dynamic_sampling import (
     select_reward_varying_groups,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/apply_verl_dynamic_sampling_patch.py"
 
@@ -88,7 +87,11 @@ class VerlPatchScriptTest(unittest.TestCase):
             result = self.run_script(target)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-            fit_source = target.read_text(encoding="utf-8").split("    def fit(self):", 1)[1]
+            patched_source = target.read_text(encoding="utf-8")
+            self.assertIn('f"val-shopping/{key}"', patched_source)
+            self.assertIn('validation_dump_infos["shopping"]', patched_source)
+            self.assertIn('reward_extra_infos_to_dump["shopping"]', patched_source)
+            fit_source = patched_source.split("    def fit(self):", 1)[1]
             generation = fit_source.index("generate_sequences(combined_gen_batch)")
             reward_filter = fit_source.index("SHOPPING_GRPO_DYNAMIC_SAMPLING_BATCH")
             skipped = fit_source.index("SHOPPING_GRPO_DYNAMIC_SAMPLING_SKIPPED")
@@ -125,6 +128,8 @@ class VerlPatchScriptTest(unittest.TestCase):
             )
             self.assertIn("extract_shopping_group_signals", fit_source)
             self.assertIn("aggregate_shopping_metrics", fit_source)
+            self.assertIn("append_sampling_audit", fit_source)
+            self.assertIn("policy_rewards=policy_rewards", fit_source)
             self.assertIn("terminal_utilities=terminal_utilities", fit_source)
             self.assertIn("sampling_invalid=sampling_invalid", fit_source)
             self.assertIn('"drop_reason": group["drop_reason"]', fit_source)
@@ -176,7 +181,11 @@ class VerlPatchScriptTest(unittest.TestCase):
                         [
                             {
                                 "infrastructure_invalid": False,
+                                "reward_unverifiable": False,
+                                "valid_for_learning": True,
                                 "reward": {
+                                    "policy_reward_version": "shopping-policy-reward-v1",
+                                    "total": float(reward),
                                     "terminal_utility": float(reward),
                                     "purchase_success": bool(reward > 0),
                                     "sampling_invalid": False,
@@ -193,12 +202,13 @@ class VerlPatchScriptTest(unittest.TestCase):
         selected_batches = []
         for batch in (make_batch(0, "a"), make_batch(8, "b")):
             rewards = batch.batch["rm_scores"].sum(dim=-1).tolist()
-            utility, success, invalid, reasons = extract_shopping_group_signals(
+            policy, utility, success, invalid, reasons = extract_shopping_group_signals(
                 batch.non_tensor_batch["shopping"].tolist()
             )
             indices, _ = select_reward_varying_groups(
                 batch.non_tensor_batch["uid"].tolist(),
                 rewards,
+                policy_rewards=policy,
                 terminal_utilities=utility,
                 purchase_success=success,
                 sampling_invalid=invalid,

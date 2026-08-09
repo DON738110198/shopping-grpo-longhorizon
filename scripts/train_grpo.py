@@ -14,8 +14,13 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import hashlib
+import importlib.metadata
 import json
 import os
+import platform
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +59,7 @@ def parse_args() -> argparse.Namespace:
         default="console",
     )
     parser.add_argument("--experiment-name", default="shopping-agent-grpo")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -88,7 +94,98 @@ def _hydra_overrides(args: argparse.Namespace) -> list[str]:
         logger_override,
         f"trainer.experiment_name={args.experiment_name}",
         *extra,
+        f"data.seed={args.seed}",
+        f"actor_rollout_ref.actor.data_loader_seed={args.seed}",
+        f"actor_rollout_ref.actor.fsdp_config.seed={args.seed}",
+        f"actor_rollout_ref.ref.fsdp_config.seed={args.seed}",
+        f"actor_rollout_ref.rollout.engine_kwargs.vllm.seed={args.seed}",
     ]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_evidence(path: Path) -> dict:
+    return {
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "sha256": _sha256(path),
+    }
+
+
+def _model_evidence(model: Path) -> list[dict]:
+    candidates = []
+    for pattern in ("config.json", "*.safetensors", "*.bin", "*.index.json"):
+        candidates.extend(model.glob(pattern))
+    return [_file_evidence(path) for path in sorted(set(candidates)) if path.is_file()]
+
+
+def _write_run_evidence(
+    *,
+    args: argparse.Namespace,
+    command: list[str],
+    environment: dict[str, str],
+    output: Path,
+    model: Path,
+    train_data: Path,
+    val_data: Path,
+    config: Path,
+) -> None:
+    resolved = subprocess.run(
+        [*command, "--cfg", "job", "--resolve"],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (output / "resolved_config.yaml").write_text(resolved.stdout, encoding="utf-8")
+    git_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    manifest = {
+        "schema_version": "shopping-grpo-run-v2",
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "git_sha": git_sha,
+        "host": socket.gethostname(),
+        "platform": platform.platform(),
+        "cuda_visible_devices": environment.get("CUDA_VISIBLE_DEVICES"),
+        "seed": args.seed,
+        "experiment_name": args.experiment_name,
+        "command": command,
+        "environment_contract": {
+            "environment": environment["SHOPPING_ENVIRONMENT_VERSION"],
+            "manifest": _file_evidence(Path(environment["SHOPPING_ENV_MANIFEST"])),
+        },
+        "model": {
+            "path": str(model),
+            "files": _model_evidence(model),
+        },
+        "data": {
+            "train": _file_evidence(train_data),
+            "validation": _file_evidence(val_data),
+        },
+        "config": _file_evidence(config),
+        "agent_loop_config": _file_evidence(DEFAULT_AGENT_CONFIG),
+        "tool_config": _file_evidence(DEFAULT_TOOL_CONFIG),
+        "packages": {
+            name: importlib.metadata.version(name)
+            for name in ("torch", "transformers", "verl", "vllm")
+        },
+    }
+    (output / "run_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
@@ -168,6 +265,7 @@ def main() -> None:
         "output": environment["GRPO_OUTPUT_DIR"],
         "logger": args.logger,
         "config": str(args.config.resolve()),
+        "seed": args.seed,
     }
     print(json.dumps(audit, ensure_ascii=False, indent=2))
     if args.dry_run:
@@ -183,6 +281,16 @@ def main() -> None:
     preflight_status = subprocess.call(preflight, cwd=ROOT, env=environment)
     if preflight_status:
         raise SystemExit(preflight_status)
+    _write_run_evidence(
+        args=args,
+        command=command,
+        environment=environment,
+        output=Path(environment["GRPO_OUTPUT_DIR"]),
+        model=Path(environment["GRPO_MODEL_PATH"]),
+        train_data=Path(environment["GRPO_TRAIN_FILE"]),
+        val_data=Path(environment["GRPO_VAL_FILE"]),
+        config=args.config.expanduser().resolve(),
+    )
     raise SystemExit(subprocess.call(command, cwd=ROOT, env=environment))
 
 

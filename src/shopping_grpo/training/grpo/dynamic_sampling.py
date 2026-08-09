@@ -1,14 +1,16 @@
 """veRL 有界动态采样补丁使用的纯 Python reward-group 选择逻辑。
 
-默认每个 task/prompt 采样 K=4 条轨迹。若组内终局效用全相同，则相对 advantage
+默认每个 task/prompt 采样 K=4 条轨迹。若组内 policy reward 全相同，则相对 advantage
 没有排序信息；若任一轨迹基础设施无效或 reward 不可验证，则整组也不能训练。
 本文件只返回保留索引和统计量，真正按索引裁剪 tensor batch 的位置在 veRL 补丁中。
 """
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Hashable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 
@@ -22,10 +24,12 @@ def aggregate_shopping_metrics(shopping_infos: Sequence[object]) -> dict[str, fl
         "strict",
         "native",
         "semantic",
+        "policy_base",
         "total",
         "efficiency",
         "penalty_overlong",
         "penalty_unfinished",
+        "penalty_guard",
         "penalty_repeat",
         "repeat_action_rate",
         "r_type",
@@ -45,9 +49,13 @@ def aggregate_shopping_metrics(shopping_infos: Sequence[object]) -> dict[str, fl
     match_scores = []
     evidence_coverage = []
     partial_purchase = []
+    model_failure = []
+    valid_for_learning = []
+    guard_rejections = []
+    repeat_actions = []
     for index, info in enumerate(shopping_infos):
         if not isinstance(info, Mapping) or not isinstance(info.get("reward"), Mapping):
-            raise ValueError(f"shopping extra field at index {index} is missing reward diagnostics")
+            raise TypeError(f"shopping extra field at index {index} is missing reward diagnostics")
         reward = info["reward"]
         for key in reward_keys:
             try:
@@ -88,6 +96,10 @@ def aggregate_shopping_metrics(shopping_infos: Sequence[object]) -> dict[str, fl
         partial_purchase.append(
             float(info.get("reward_type") == "partial_alternative_purchase")
         )
+        model_failure.append(float(bool(info.get("model_failure"))))
+        valid_for_learning.append(float(bool(info.get("valid_for_learning"))))
+        guard_rejections.append(float(info.get("guard_rejections", 0)))
+        repeat_actions.append(float(info.get("repeat_actions", 0)))
 
     def mean(values):
         return sum(values) / len(values)
@@ -97,6 +109,7 @@ def aggregate_shopping_metrics(shopping_infos: Sequence[object]) -> dict[str, fl
         "reward/strict_mean": mean(rewards["strict"]),
         "reward/native_mean": mean(rewards["native"]),
         "reward/semantic_mean": mean(rewards["semantic"]),
+        "reward/policy_base_mean": mean(rewards["policy_base"]),
         "reward/shaped_min": min(rewards["total"]),
         "reward/shaped_mean": mean(rewards["total"]),
         "reward/shaped_max": max(rewards["total"]),
@@ -110,6 +123,7 @@ def aggregate_shopping_metrics(shopping_infos: Sequence[object]) -> dict[str, fl
         "reward/efficiency_mean": mean(rewards["efficiency"]),
         "penalty/overlong_mean": mean(rewards["penalty_overlong"]),
         "penalty/unfinished_mean": mean(rewards["penalty_unfinished"]),
+        "penalty/guard_mean": mean(rewards["penalty_guard"]),
         "penalty/repeat_mean": mean(rewards["penalty_repeat"]),
         "component/r_type_mean": mean(rewards["r_type"]),
         "component/r_att_mean": mean(rewards["r_att"]),
@@ -119,6 +133,10 @@ def aggregate_shopping_metrics(shopping_infos: Sequence[object]) -> dict[str, fl
         "trajectory/done_rate": mean(done),
         "trajectory/max_steps_rate": mean(max_steps),
         "trajectory/repeat_action_rate": mean(rewards["repeat_action_rate"]),
+        "trajectory/guard_rejections_mean": mean(guard_rejections),
+        "trajectory/repeat_actions_mean": mean(repeat_actions),
+        "trajectory/model_failure_rate": mean(model_failure),
+        "trajectory/valid_for_learning_rate": mean(valid_for_learning),
         "trajectory/infrastructure_invalid_rate": mean(infrastructure_invalid),
         "trajectory/reward_unverifiable_rate": mean(reward_unverifiable),
         "trajectory/sampling_invalid_rate": mean(sampling_invalid),
@@ -127,28 +145,32 @@ def aggregate_shopping_metrics(shopping_infos: Sequence[object]) -> dict[str, fl
 
 def extract_shopping_group_signals(
     shopping_infos: Sequence[object],
-) -> tuple[list[float], list[bool], list[bool], list[tuple[str, ...]]]:
-    """Return terminal utility, success metrics, and explicit invalid reasons."""
+) -> tuple[list[float], list[float], list[bool], list[bool], list[tuple[str, ...]]]:
+    """Return policy/raw rewards, success, and explicit learning-validity reasons."""
+    policy_rewards = []
     terminal_utilities = []
     purchase_success = []
     sampling_invalid = []
     invalid_reasons = []
     for index, info in enumerate(shopping_infos):
         if not isinstance(info, Mapping) or not isinstance(info.get("reward"), Mapping):
-            raise ValueError(f"shopping extra field at index {index} is missing reward diagnostics")
+            raise TypeError(f"shopping extra field at index {index} is missing reward diagnostics")
         try:
+            policy_reward = float(info["reward"]["total"])
             terminal_utility = float(info["reward"]["terminal_utility"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"shopping extra field at index {index} is missing terminal_utility"
+            raise TypeError(
+                f"shopping extra field at index {index} is missing policy or terminal reward"
             ) from exc
-        if not math.isfinite(terminal_utility):
+        if not math.isfinite(policy_reward) or not math.isfinite(terminal_utility):
             raise ValueError(
-                f"shopping terminal_utility at index {index} is not finite"
+                f"shopping reward at index {index} is not finite"
             )
+        if info["reward"].get("policy_reward_version") != "shopping-policy-reward-v1":
+            raise ValueError(f"shopping extra field at index {index} has wrong policy reward version")
         raw_purchase_success = info["reward"].get("purchase_success")
         if not isinstance(raw_purchase_success, (bool, int, float)):
-            raise ValueError(
+            raise TypeError(
                 f"shopping extra field at index {index} is missing purchase_success"
             )
         if "infrastructure_invalid" not in info:
@@ -164,12 +186,19 @@ def extract_shopping_group_signals(
             info["reward"].get("sampling_invalid", False)
         )
         if reward_sampling_invalid and not reasons:
-            reasons.append("reward_sampling_invalid")
+            reasons.append(str(info.get("invalid_reason") or "reward_sampling_invalid"))
+        expected_valid = not reasons
+        if bool(info.get("valid_for_learning")) != expected_valid:
+            raise ValueError(
+                f"shopping extra field at index {index} has inconsistent valid_for_learning"
+            )
+        policy_rewards.append(policy_reward)
         terminal_utilities.append(terminal_utility)
         purchase_success.append(bool(raw_purchase_success))
         sampling_invalid.append(bool(reasons))
         invalid_reasons.append(tuple(reasons))
     return (
+        policy_rewards,
         terminal_utilities,
         purchase_success,
         sampling_invalid,
@@ -181,6 +210,7 @@ def select_reward_varying_groups(
     uids: Sequence[Hashable],
     seq_rewards: Sequence[float],
     *,
+    policy_rewards: Sequence[float] | None = None,
     terminal_utilities: Sequence[float] | None = None,
     purchase_success: Sequence[bool] | None = None,
     sampling_invalid: Sequence[bool] | None = None,
@@ -189,7 +219,7 @@ def select_reward_varying_groups(
 ) -> tuple[list[int], dict[str, Any]]:
     """返回 reward 有差异且全部有效的 group 所对应的 trajectory 索引。
 
-    对 uid=u 的组，先计算 ``range_u = max(utility_u) - min(utility_u)``。仅当
+    对 uid=u 的组，先计算 ``range_u = max(policy_reward_u) - min(policy_reward_u)``。仅当
     ``range_u > tolerance`` 且组内没有 sampling_invalid 时保留。返回索引保持原始
     顺序，使调用方能对 input_ids、attention_mask、old_log_probs、rewards 以及
     extra_fields 使用同一个 selection，避免张量与轨迹诊断错位。
@@ -200,6 +230,7 @@ def select_reward_varying_groups(
             f"uids and seq_rewards must have equal length, got {len(uids)} and {len(seq_rewards)}"
         )
     optional_sequences = {
+        "policy_rewards": policy_rewards,
         "terminal_utilities": terminal_utilities,
         "purchase_success": purchase_success,
         "sampling_invalid": sampling_invalid,
@@ -211,9 +242,8 @@ def select_reward_varying_groups(
     if tolerance < 0 or not math.isfinite(tolerance):
         raise ValueError(f"tolerance must be a finite non-negative number, got {tolerance!r}")
 
-    utility_values = (
-        terminal_utilities if terminal_utilities is not None else seq_rewards
-    )
+    policy_values = policy_rewards if policy_rewards is not None else seq_rewards
+    terminal_values = terminal_utilities if terminal_utilities is not None else seq_rewards
     success_values = (
         purchase_success if purchase_success is not None else [False] * len(uids)
     )
@@ -230,7 +260,8 @@ def select_reward_varying_groups(
     for index, (
         uid,
         raw_reward,
-        raw_utility,
+        raw_policy_reward,
+        raw_terminal_utility,
         raw_success,
         raw_invalid,
         raw_reasons,
@@ -238,7 +269,8 @@ def select_reward_varying_groups(
         zip(
             uids,
             seq_rewards,
-            utility_values,
+            policy_values,
+            terminal_values,
             success_values,
             invalid_values,
             reason_values,
@@ -253,10 +285,19 @@ def select_reward_varying_groups(
         reward = float(raw_reward)
         if not math.isfinite(reward):
             raise ValueError(f"seq_reward at index {index} is not finite: {raw_reward!r}")
-        utility = float(raw_utility)
-        if not math.isfinite(utility):
+        metadata_reward = float(raw_policy_reward)
+        if not math.isfinite(metadata_reward):
             raise ValueError(
-                f"terminal_utility at index {index} is not finite: {raw_utility!r}"
+                f"policy_reward at index {index} is not finite: {raw_policy_reward!r}"
+            )
+        if not math.isclose(reward, metadata_reward, rel_tol=0.0, abs_tol=tolerance):
+            raise ValueError(
+                f"policy reward mismatch at index {index}: tensor={reward}, metadata={metadata_reward}"
+            )
+        terminal_utility = float(raw_terminal_utility)
+        if not math.isfinite(terminal_utility):
+            raise ValueError(
+                f"terminal_utility at index {index} is not finite: {raw_terminal_utility!r}"
             )
 
         group = grouped.setdefault(
@@ -273,7 +314,7 @@ def select_reward_varying_groups(
         )
         group["indices"].append(index)
         group["rewards"].append(reward)
-        group["terminal_utilities"].append(utility)
+        group["terminal_utilities"].append(terminal_utility)
         group["purchase_success"].append(bool(raw_success))
         group["sampling_invalid"].append(bool(raw_invalid))
         group["sampling_invalid_reasons"].extend(str(reason) for reason in raw_reasons)
@@ -282,15 +323,16 @@ def select_reward_varying_groups(
     dropped_uids: list[Hashable] = []
     groups: list[dict[str, Any]] = []
     for uid, group in grouped.items():
+        rewards = group["rewards"]
         utilities = group["terminal_utilities"]
-        utility_min = min(utilities)
-        utility_max = max(utilities)
-        utility_varying = utility_max - utility_min > tolerance
+        reward_min = min(rewards)
+        reward_max = max(rewards)
+        reward_varying = reward_max - reward_min > tolerance
         has_sampling_invalid = any(group["sampling_invalid"])
         reasons = tuple(sorted(set(group["sampling_invalid_reasons"])))
         if has_sampling_invalid:
             drop_reason = "sampling_invalid"
-        elif not utility_varying:
+        elif not reward_varying:
             drop_reason = "constant_reward"
         else:
             drop_reason = None
@@ -306,9 +348,11 @@ def select_reward_varying_groups(
                 "rewards": tuple(group["rewards"]),
                 "terminal_utilities": tuple(utilities),
                 "purchase_success": tuple(group["purchase_success"]),
-                "utility_min": utility_min,
-                "utility_max": utility_max,
-                "reward_varying": utility_varying,
+                "reward_min": reward_min,
+                "reward_max": reward_max,
+                "utility_min": min(utilities),
+                "utility_max": max(utilities),
+                "reward_varying": reward_varying,
                 "sampling_invalid": has_sampling_invalid,
                 "sampling_invalid_reasons": reasons,
                 "drop_reason": drop_reason,
@@ -328,7 +372,16 @@ def select_reward_varying_groups(
         "all_equal_group_count": sum(
             not group["reward_varying"] for group in groups
         ),
+        "all_zero_reward_group_count": sum(
+            max(abs(value) for value in group["rewards"]) <= tolerance
+            for group in groups
+        ),
+        # The veRL patch used this name before policy/raw rewards were separated.
         "all_zero_utility_group_count": sum(
+            max(abs(value) for value in group["rewards"]) <= tolerance
+            for group in groups
+        ),
+        "all_zero_terminal_utility_group_count": sum(
             max(abs(value) for value in group["terminal_utilities"]) <= tolerance
             for group in groups
         ),
@@ -361,3 +414,54 @@ def select_reward_varying_groups(
         "groups": tuple(groups),
     }
     return trajectory_indices, stats
+
+
+def append_sampling_audit(
+    output_dir: str | Path,
+    *,
+    global_step: int,
+    generation_batch: int,
+    group_stats: Mapping[str, Any],
+    shopping_infos: Sequence[object],
+) -> Path:
+    """Append compact per-group rollout evidence from the central trainer process."""
+    destination = Path(output_dir) / "sampling_audit.jsonl"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("a", encoding="utf-8") as handle:
+        for group in group_stats.get("groups", ()):
+            trajectories = []
+            for index in group["indices"]:
+                info = shopping_infos[index]
+                if not isinstance(info, Mapping):
+                    raise TypeError(f"shopping audit entry at index {index} is not an object")
+                reward = info.get("reward") or {}
+                trajectories.append(
+                    {
+                        "task_id": info.get("task_id"),
+                        "termination_reason": info.get("termination_reason"),
+                        "reward_type": info.get("reward_type"),
+                        "policy_reward": reward.get("total"),
+                        "terminal_utility": reward.get("terminal_utility"),
+                        "strict": reward.get("strict"),
+                        "valid_for_learning": info.get("valid_for_learning"),
+                        "invalid_reason": info.get("invalid_reason"),
+                        "model_failure": info.get("model_failure"),
+                        "steps": info.get("steps"),
+                        "guard_rejections": info.get("guard_rejections"),
+                        "repeat_actions": info.get("repeat_actions"),
+                        "action_trace": info.get("action_trace", []),
+                    }
+                )
+            record = {
+                "global_step": int(global_step),
+                "generation_batch": int(generation_batch),
+                "uid": group["uid"],
+                "kept": bool(group["kept"]),
+                "drop_reason": group["drop_reason"],
+                "sampling_invalid_reasons": group["sampling_invalid_reasons"],
+                "policy_rewards": group["rewards"],
+                "terminal_utilities": group["terminal_utilities"],
+                "trajectories": trajectories,
+            }
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    return destination

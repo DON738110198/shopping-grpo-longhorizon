@@ -24,6 +24,7 @@ data:
   return_raw_chat: true
   filter_overlong_prompts: true
   truncation: error
+  seed: 42
 
 actor_rollout_ref:
   model:
@@ -47,6 +48,7 @@ actor_rollout_ref:
     ppo_micro_batch_size_per_gpu: 1
     ppo_max_token_len_per_gpu: 24576
     use_dynamic_bsz: false
+    data_loader_seed: 42
     freeze_vision_tower: true
     # token-mean：先在所有有效 response token 上聚合 policy loss；padding/tool 输入
     # 是否参与由 veRL 的 response mask 决定。
@@ -64,6 +66,7 @@ actor_rollout_ref:
       lr: 1.0e-6
       lr_warmup_steps_ratio: 0.03
     fsdp_config:
+      seed: 42
       optimizer_offload: true
       param_offload: true
   rollout:
@@ -81,6 +84,9 @@ actor_rollout_ref:
     max_num_batched_tokens: 24576
     free_cache_engine: true
     calculate_log_probs: true
+    engine_kwargs:
+      vllm:
+        seed: 42
     log_prob_micro_batch_size_per_gpu: 1
     log_prob_max_token_len_per_gpu: 24576
     log_prob_use_dynamic_bsz: false
@@ -112,6 +118,7 @@ actor_rollout_ref:
     log_prob_max_token_len_per_gpu: 24576
     log_prob_use_dynamic_bsz: false
     fsdp_config:
+      seed: 42
       param_offload: true
 
 algorithm:
@@ -154,5 +161,7 @@ trainer:
   project_name: shopping-grpo
   experiment_name: shopping-agent-grpo
   default_local_dir: ${oc.env:GRPO_OUTPUT_DIR}
+  rollout_data_dir: ${oc.env:GRPO_OUTPUT_DIR}/rollouts
+  validation_data_dir: ${oc.env:GRPO_OUTPUT_DIR}/validation
   n_gpus_per_node: 1
   nnodes: 1

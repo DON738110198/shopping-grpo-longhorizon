@@ -6,9 +6,23 @@
   timeout: 60
   max_steps: 35
   required_environment_version: shopsimulator-environment-v2.1
-  # constraint_aware 最终仍以环境提供的 terminal_utility 为学习信号，同时将品牌、
-  # 规格、预算等分解项写进 extra_fields 供监控和 dynamic sampling 使用。
-  reward_mode: constraint_aware
+  # Reward v3 保持原样作为环境事实；policy_v1 只在训练侧给非法动作、重复动作和
+  # 可归因于模型的非正常终止提供有界学习信号。
+  reward_mode: policy_v1
+  policy_reward:
+    version: shopping-policy-reward-v1
+    guard_rejection_penalty: 0.03
+    guard_rejection_cap: 3
+    repeat_action_penalty: 0.02
+    repeat_action_cap: 3
+    minimum: -1.0
+    maximum: 1.0
+    model_failure_rewards:
+      assistant_finished_without_environment_done: -0.40
+      max_steps: -0.50
+      context_hard_limit_exceeded: -0.55
+      parallel_tool_calls: -0.60
+      too_many_guard_rejections: -0.70
   # 模型窗口 24576 = 最多 16384 输入预算 + 512 本轮生成保留 + 512 安全余量，
   # 剩余空间用于当前 trajectory 增长；默认不主动压缩历史，超限即标无效。
   context_window_tokens: 24576

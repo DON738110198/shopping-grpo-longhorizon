@@ -14,12 +14,13 @@ from typing import Any
 from uuid import uuid4
 
 from shopping_grpo.environment.actions import action_reject_reason
-from shopping_grpo.environment.tools import tool_call_to_action
 from shopping_grpo.environment.observation import render_structured_observation
+from shopping_grpo.environment.tools import tool_call_to_action
 from shopping_grpo.training.grpo.adapter.runtime import (
     current_environment,
     current_runtime_state,
     record_action_attempt,
+    record_action_outcome,
     validate_reward,
 )
 
@@ -76,7 +77,7 @@ class ShopSimulatorTool(BaseTool):
                 return ToolResponse(text="Error: maximum executed tool steps reached."), 0.0, step
             return ToolResponse(text="Reasoning recorded. Continue with one environment tool call."), 0.0, step
         observation = state.get("latest_observation", "")
-        record_action_attempt(state, self.name, parameters, observation)
+        action_event = record_action_attempt(state, self.name, parameters, observation)
         state["action_attempt_after_truncation_count"] += int(
             bool(state.get("latest_observation_truncated"))
         )
@@ -84,6 +85,11 @@ class ShopSimulatorTool(BaseTool):
         # 这个按钮也必须拒绝，防止模型凭记忆向已变化的网页发送陈旧动作。
         reason = action_reject_reason(self.name, parameters, observation)
         if reason:
+            record_action_outcome(
+                action_event,
+                accepted=False,
+                guard_reason=reason,
+            )
             state["guard_rejection_count"] += 1
             state["guard_rejection_after_truncation_count"] += int(
                 bool(state.get("latest_observation_truncated"))
@@ -115,13 +121,19 @@ class ShopSimulatorTool(BaseTool):
                 done=bool(result.get("done", False)),
                 reward=float(result.get("reward", 0.0)),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - tool faults are recorded as infrastructure failures.
+            record_action_outcome(
+                action_event,
+                accepted=True,
+                error=f"{exc.__class__.__name__}:{exc}",
+            )
             _terminate(
                 state,
                 f"tool_error:{exc.__class__.__name__}:{exc}",
                 infrastructure_invalid=True,
             )
             return ToolResponse(text=f"Error: ShopSimulator tool execution failed: {exc}"), 0.0, {"error": state["error"]}
+        record_action_outcome(action_event, accepted=True)
         state["consecutive_guard_rejections"] = 0
         # done 只说明环境声明终局；还需同时验证 over、有限 reward 和 Reward v3 字段，
         # 才能把这条轨迹当成有效学习样本。

@@ -10,7 +10,6 @@ import sys
 from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
 
-
 EXPECTED_VERSIONS = {
     "verl": "0.8.0",
     "vllm": "0.25.1",
@@ -22,7 +21,7 @@ EXPECTED_VERSIONS = {
     "swanlab": "0.9.1",
 }
 EXPECTED_TRANSFORMERS_REVISION = "7ea2320c76117e6742364808a666ef6f2fb40a67"
-PATCH_MARKER = "SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V3"
+PATCH_MARKER = "SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V4"
 MAX_SAFE_RESPONSE_LENGTH = 20480
 MAX_SAFE_SEQUENCE_LENGTH = 24576
 CURRENT_RUNTIME_FILES = {
@@ -186,11 +185,15 @@ def validate_dynamic_sampling(config, verl_source: Path, installed):
         )
     except ImportError as exc:
         raise SystemExit(f"shopping dynamic sampling helper is unavailable: {exc}") from exc
-    utility, success, invalid, reasons = extract_shopping_group_signals(
+    policy, utility, success, invalid, reasons = extract_shopping_group_signals(
         [
             {
                 "infrastructure_invalid": False,
+                "reward_unverifiable": False,
+                "valid_for_learning": True,
                 "reward": {
+                    "policy_reward_version": "shopping-policy-reward-v1",
+                    "total": reward,
                     "terminal_utility": reward,
                     "purchase_success": reward > 0,
                     "sampling_invalid": False,
@@ -202,6 +205,7 @@ def validate_dynamic_sampling(config, verl_source: Path, installed):
     indices, _ = select_reward_varying_groups(
         ["preflight"] * 4,
         [0.0, 1.0, 0.0, 0.0],
+        policy_rewards=policy,
         terminal_utilities=utility,
         purchase_success=success,
         sampling_invalid=invalid,
@@ -388,13 +392,14 @@ def main():
     try:
         import torch
         import verl
-        from verl.experimental.agent_loop.tool_parser import ToolParser
         from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
+        from verl.experimental.agent_loop.tool_parser import ToolParser
+        from verl.tools.base_tool import BaseTool
+        from verl.utils.tracking import Tracking
+
         from shopping_grpo.training.grpo.adapter.agent_loop import ShoppingToolAgentLoop
         from shopping_grpo.training.grpo.adapter.tools import ShopSimulatorTool
         from shopping_grpo.training.grpo.compat import install_torch_padding_fallback
-        from verl.tools.base_tool import BaseTool
-        from verl.utils.tracking import Tracking
     except ImportError as exc:
         raise SystemExit(
             "incompatible veRL 0.8 install: required AgentLoop/Tool APIs are unavailable; "

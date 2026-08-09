@@ -9,7 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.train_grpo import build_command, main as train_grpo_main, parse_args
+from scripts.train_grpo import build_command, parse_args
+from scripts.train_grpo import main as train_grpo_main
 from shopping_grpo.cli import main as cli_main
 from shopping_grpo.smoke import run_cpu_smoke
 
@@ -90,6 +91,8 @@ class PublicEntrypointTest(unittest.TestCase):
         self.assertEqual(environment["GRPO_TRAIN_FILE"], str(train))
         self.assertEqual(environment["GRPO_VAL_FILE"], str(validation))
         self.assertIn("trainer.logger=[console]", command)
+        self.assertIn("data.seed=42", command)
+        self.assertIn("actor_rollout_ref.rollout.engine_kwargs.vllm.seed=42", command)
 
     def test_public_grpo_launcher_runs_preflight_before_training(self):
         root = Path(__file__).resolve().parents[1]
@@ -126,7 +129,9 @@ class PublicEntrypointTest(unittest.TestCase):
             with patch.object(sys, "argv", argv), patch(
                 "scripts.train_grpo.subprocess.call",
                 side_effect=[0, 0],
-            ) as subprocess_call, self.assertRaises(SystemExit) as completed:
+            ) as subprocess_call, patch(
+                "scripts.train_grpo._write_run_evidence"
+            ) as write_evidence, self.assertRaises(SystemExit) as completed:
                 train_grpo_main()
 
             self.assertEqual(completed.exception.code, 0)
@@ -142,6 +147,7 @@ class PublicEntrypointTest(unittest.TestCase):
                 self.assertIn("trainer.total_training_steps=1", command)
             self.assertIn("check_grpo_runtime.py", preflight[1])
             self.assertIn("verl.trainer.main_ppo", training)
+            write_evidence.assert_called_once()
 
 
 if __name__ == "__main__":

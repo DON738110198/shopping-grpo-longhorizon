@@ -94,7 +94,8 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
             loop.timeout = 60
             loop.max_steps = 35
             loop.required_environment_version = "shopsimulator-environment-v2.1"
-            loop.reward_mode = "constraint_aware"
+            loop.reward_mode = "policy_v1"
+            loop.policy_reward = {}
             loop.env_factory = FakeEnv
             with patch.object(ToolAgentLoop, "run", fake_parent_run):
                 return await ShoppingToolAgentLoop.run(
@@ -153,7 +154,7 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
     def test_runtime_state_has_no_hidden_goal_fields(self):
         state = make_runtime_state(task_id=2, max_steps=35)
         self.assertNotIn("goal", state)
-        self.assertNotIn("reward_detail", state)
+        self.assertIsNone(state["reward_detail"])
 
     def test_task_id_is_read_from_verl_extra_info(self):
         self.assertEqual(task_id_from_kwargs({"extra_info": {"task_id": 42}}), 42)

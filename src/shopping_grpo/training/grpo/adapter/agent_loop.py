@@ -26,6 +26,7 @@ from shopping_grpo.training.grpo.adapter.runtime import (
     reward_breakdown,
     task_id_from_kwargs,
     terminal_reward,
+    validate_policy_reward_config,
 )
 from shopping_grpo.training.grpo.adapter.session import ShopSimulatorSession
 
@@ -40,7 +41,8 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         timeout=60,
         max_steps=35,
         required_environment_version=None,
-        reward_mode="native",
+        reward_mode="policy_v1",
+        policy_reward=None,
         context_window_tokens=24576,
         context_generation_reserve_tokens=512,
         context_safety_margin_tokens=512,
@@ -60,6 +62,7 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         self.max_steps = int(max_steps)
         self.required_environment_version = required_environment_version
         self.reward_mode = str(reward_mode)
+        self.policy_reward = validate_policy_reward_config(policy_reward)
         self.context_window_tokens = int(context_window_tokens)
         self.context_generation_reserve_tokens = int(context_generation_reserve_tokens)
         self.context_safety_margin_tokens = int(context_safety_margin_tokens)
@@ -90,7 +93,7 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             raise ValueError("all observation token budgets must be at least 64")
         if self.observation_search_top_k < 1:
             raise ValueError("observation_search_top_k must be positive")
-        if self.reward_mode not in {"native", "constraint_aware"}:
+        if self.reward_mode not in {"native", "policy_v1"}:
             raise ValueError(f"unknown shopping reward mode: {self.reward_mode!r}")
         self.env_factory = env_factory
 
@@ -145,7 +148,6 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
                 runtime_state["terminate"] = True
                 runtime_state["termination_reason"] = "context_hard_limit_exceeded"
                 runtime_state["error"] = runtime_state["termination_reason"]
-                runtime_state["infrastructure_invalid"] = True
             return AgentState.TERMINATED
         if stats is not None and stats.removed_tokens:
             # routed-experts 的额外状态无法随 token 一起安全裁剪，因此直接判为无效。
@@ -212,7 +214,7 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
                 raise ObservationProjectionError(
                     "projected observation exceeds veRL character fallback limit"
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - projection failures must become invalid samples.
             state["terminate"] = True
             state["termination_reason"] = "observation_projection_failed"
             state["error"] = f"observation_projection_failed:{exc.__class__.__name__}:{exc}"
@@ -265,9 +267,27 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
                 state["error"] = "assistant_finished_without_environment_done"
                 state["termination_reason"] = state["error"]
                 state["terminate"] = True
+            response_length = len(output.response_ids)
+            alignment_lengths = {
+                "response_ids": response_length,
+                "response_mask": len(output.response_mask),
+            }
+            if output.response_logprobs is not None:
+                alignment_lengths["response_logprobs"] = len(output.response_logprobs)
+            if response_length == 0 or len(set(alignment_lengths.values())) != 1:
+                state["infrastructure_invalid"] = True
+                state["termination_reason"] = "trajectory_alignment_invalid"
+                state["error"] = (
+                    "trajectory_alignment_invalid:"
+                    + ",".join(f"{key}={value}" for key, value in alignment_lengths.items())
+                )
             # 父类结束后统一从环境状态结算，避免把中途异常当作正常终局奖励。
-            breakdown = reward_breakdown(state)
-            output.reward_score = terminal_reward(state, mode=self.reward_mode)
+            breakdown = reward_breakdown(state, self.policy_reward)
+            output.reward_score = terminal_reward(
+                state,
+                mode=self.reward_mode,
+                policy_config=self.policy_reward,
+            )
             # 保留标量/布尔诊断，不把隐藏 goal 或完整商品答案泄漏给训练侧。
             output.extra_fields["shopping"] = {
                 "task_id": task_id,
@@ -278,7 +298,12 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
                 "infrastructure_invalid": bool(state["infrastructure_invalid"]),
                 "action_attempts": int(state["action_attempt_count"]),
                 "repeat_actions": int(state["repeat_action_count"]),
+                "action_trace": list(state["action_events"]),
                 "reward_mode": self.reward_mode,
+                "policy_reward_version": breakdown["policy_reward_version"],
+                "valid_for_learning": bool(breakdown["valid_for_learning"]),
+                "invalid_reason": breakdown["invalid_reason"],
+                "model_failure": bool(breakdown["model_failure"]),
                 "reward_version": state.get("reward_version"),
                 "reward_type": state.get("reward_type"),
                 "reward_valid": bool(state.get("reward_valid", True)),
