@@ -3,21 +3,73 @@ import tempfile
 import unittest
 from http.client import RemoteDisconnected
 from pathlib import Path
-from urllib.error import URLError
 from unittest.mock import patch
+from urllib.error import URLError
 
 from shopping_grpo.environment.actions import action_guard_tool_message
 from shopping_grpo.environment.client import ShopEnvironmentError
 from shopping_grpo.evaluation.rollout import (
+    SYSTEM_PROMPT,
     CollectionInfrastructureError,
     OpenAIChatClient,
-    SYSTEM_PROMPT,
-    collect_tasks,
     collect_for_task,
+    collect_tasks,
     completed_task_attempts,
     load_tasks,
     rollout_interrupted,
 )
+
+
+def search_results_state(*asins):
+    return {
+        "observation_version": "shopping-observation-v2",
+        "page_type": "search_results",
+        "query": "乳胶枕",
+        "normalized_query": "乳胶枕",
+        "page": 1,
+        "total_pages": 1,
+        "total_results": len(asins),
+        "rank_start": 1,
+        "rank_end": len(asins),
+        "products": [
+            {
+                "rank": index,
+                "asin": asin,
+                "price": "100.0",
+                "brand": "测试品牌",
+                "category": "枕头",
+                "key_attributes": ["乳胶"],
+                "title": "乳胶枕",
+            }
+            for index, asin in enumerate(asins, start=1)
+        ],
+        "search_available": False,
+        "actions": ["Back to Search", *asins],
+    }
+
+
+def product_state(*actions, page_type="product_detail", subpage=None):
+    state = {
+        "observation_version": "shopping-observation-v2",
+        "page_type": page_type,
+        "product": {
+            "asin": "100000000001",
+            "title": "乳胶枕",
+            "brand": "测试品牌",
+            "category": "枕头",
+            "price": "100.0",
+            "key_attributes": ["乳胶"],
+        },
+        "selected_price": "100.0",
+        "selected_options": {},
+        "available_options": {},
+        "search_available": False,
+        "actions": list(actions),
+    }
+    if page_type == "information_subpage":
+        state["subpage"] = subpage or "Features"
+        state["content"] = "test details"
+    return state
 
 
 class FakeEnv:
@@ -32,13 +84,13 @@ class FakeEnv:
         self.actions.append(action)
         if action == "search[乳胶枕]":
             return {
-                "instruction": "results [SEP] 100000000001 [SEP] 乳胶枕",
+                "observation_state": search_results_state("100000000001"),
                 "reward": 0.0,
                 "done": False,
             }
         if action == "click[100000000001]":
             return {
-                "instruction": 'detail\n\n可点击的按钮: ["Buy Now"]',
+                "observation_state": product_state("Buy Now"),
                 "reward": 0.0,
                 "done": False,
             }
@@ -84,25 +136,29 @@ class GuardRecoveryEnv(FakeEnv):
         self.actions.append(action)
         if action == "search[乳胶枕]":
             return {
-                "instruction": "results [SEP] 100000000001 [SEP] 乳胶枕",
+                "observation_state": search_results_state("100000000001"),
                 "reward": 0.0,
                 "done": False,
             }
         if action == "click[100000000001]":
             return {
-                "instruction": 'detail\n\n可点击的按钮: ["Features", "Buy Now"]',
+                "observation_state": product_state("Features", "Buy Now"),
                 "reward": 0.0,
                 "done": False,
             }
         if action == "click[Features]":
             return {
-                "instruction": 'features\n\n可点击的按钮: ["< Prev"]',
+                "observation_state": product_state(
+                    "< Prev",
+                    page_type="information_subpage",
+                    subpage="Features",
+                ),
                 "reward": 0.0,
                 "done": False,
             }
         if action == "click[< Prev]":
             return {
-                "instruction": 'detail\n\n可点击的按钮: ["Features", "Buy Now"]',
+                "observation_state": product_state("Features", "Buy Now"),
                 "reward": 0.0,
                 "done": False,
             }
@@ -275,22 +331,28 @@ class RolloutTest(unittest.TestCase):
             def step(self, action):
                 self.actions.append(action)
                 if action == "search[乳胶枕]":
-                    return {"instruction": "results [SEP] 100000000001", "reward": 0.0, "done": False}
+                    return {
+                        "observation_state": search_results_state("100000000001"),
+                        "reward": 0.0,
+                        "done": False,
+                    }
                 if action == "click[100000000001]":
                     return {
-                        "instruction": 'detail\n\n可点击的按钮: ["满天星", "Description", "Buy Now"]',
+                        "observation_state": product_state(
+                            "满天星", "Description", "Buy Now"
+                        ),
                         "reward": 0.0,
                         "done": False,
                     }
                 if action == "click[满天星]":
                     return {
-                        "instruction": 'selected\n\n可点击的按钮: ["Description", "Buy Now"]',
+                        "observation_state": product_state("Description", "Buy Now"),
                         "reward": 0.0,
                         "done": False,
                     }
                 if action == "click[Description]":
                     return {
-                        "instruction": 'details\n\n可点击的按钮: ["Buy Now"]',
+                        "observation_state": product_state("Buy Now"),
                         "reward": 0.0,
                         "done": False,
                     }
@@ -334,16 +396,20 @@ class RolloutTest(unittest.TestCase):
             def step(self, action):
                 self.actions.append(action)
                 if action == "search[乳胶枕]":
-                    return {"instruction": "results [SEP] 100000000001", "reward": 0.0, "done": False}
+                    return {
+                        "observation_state": search_results_state("100000000001"),
+                        "reward": 0.0,
+                        "done": False,
+                    }
                 if action == "click[100000000001]":
                     return {
-                        "instruction": 'detail\n\n可点击的按钮: ["满天星", "Buy Now"]',
+                        "observation_state": product_state("满天星", "Buy Now"),
                         "reward": 0.0,
                         "done": False,
                     }
                 if action == "click[满天星]":
                     return {
-                        "instruction": 'selected\n\n可点击的按钮: ["Buy Now"]',
+                        "observation_state": product_state("Buy Now"),
                         "reward": 0.0,
                         "done": False,
                     }

@@ -1,6 +1,5 @@
 """Observation projection preserves actionable state and bounds visible tokens."""
 
-import json
 import unittest
 
 from shopping_grpo.environment.actions import (
@@ -8,32 +7,49 @@ from shopping_grpo.environment.actions import (
     clickable_buttons,
     product_ids,
 )
+from shopping_grpo.environment.observation import (
+    StructuredObservationError,
+    render_structured_observation,
+)
 from shopping_grpo.environment.projection import (
-    ObservationProjectionError,
     TRUNCATION_MARKER,
+    ObservationProjectionError,
     project_observation,
 )
-from shopping_grpo.environment.observation import render_structured_observation
 
 
 def search_page(product_count=12, page=1):
-    segments = [
-        "Instruction:",
-        "find a useful product",
-        "Back to Search",
-        f"Page {page} (Total results: 40)",
-        "Next >",
-    ]
-    buttons = ["back to search", "next >"]
+    products = []
+    buttons = ["Back to Search", "Next >"]
     for index in range(product_count):
         asin = f"{100000000000 + index}"
-        segments.extend([asin, f"product title {index} " + "x" * 40, f"{index + 1}.0"])
+        products.append(
+            {
+                "rank": index + 1,
+                "asin": asin,
+                "price": f"{index + 1}.0",
+                "brand": "test brand",
+                "category": "test category",
+                "key_attributes": ["test attribute"],
+                "title": f"product title {index} " + "x" * 40,
+            }
+        )
         buttons.append(asin)
-    return (
-        " [SEP] ".join(segments)
-        + "\n\n搜索功能是否可用: False"
-        + "\n\n可点击的按钮: "
-        + json.dumps(buttons, ensure_ascii=False)
+    return render_structured_observation(
+        {
+            "observation_version": "shopping-observation-v2",
+            "page_type": "search_results",
+            "query": "useful product",
+            "normalized_query": "useful product",
+            "page": page,
+            "total_pages": 2,
+            "total_results": 40,
+            "rank_start": (page - 1) * 20 + 1,
+            "rank_end": (page - 1) * 20 + product_count,
+            "products": products,
+            "search_available": False,
+            "actions": buttons,
+        }
     )
 
 
@@ -89,19 +105,12 @@ class ObservationProjectionTest(unittest.TestCase):
             search_top_k=20,
         )
 
-        self.assertIn("page: Page 2", visible)
+        self.assertIn("Page 2 of 2", visible)
         self.assertEqual(product_ids(visible), product_ids(raw))
 
-    def test_capacity_mismatch_fails_instead_of_silently_dropping_products(self):
-        raw = search_page(product_count=20)
-        with self.assertRaisesRegex(ObservationProjectionError, "page capacity"):
-            project_observation(
-                "search_products",
-                raw,
-                count_tokens=len,
-                token_budget=1200,
-                search_top_k=10,
-            )
+    def test_structured_renderer_rejects_page_above_frozen_capacity(self):
+        with self.assertRaisesRegex(StructuredObservationError, "frozen page size"):
+            search_page(product_count=21)
 
     def test_short_product_page_is_identity_projection(self):
         raw = (
