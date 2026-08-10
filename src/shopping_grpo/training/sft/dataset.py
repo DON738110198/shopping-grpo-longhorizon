@@ -5,11 +5,10 @@
 手写 Qwen 特殊 token 或 tool-call 格式。
 """
 
-import json
 import hashlib
+import json
 from copy import deepcopy
 from pathlib import Path
-
 
 IGNORE_INDEX = -100
 
@@ -53,7 +52,14 @@ def normalize_messages_for_chat_template(messages):
     return normalized
 
 
-def build_supervised_example(messages, tools, tokenizer, max_length=8192, chat_template=None):
+def build_supervised_example(
+    messages,
+    tools,
+    tokenizer,
+    max_length=8192,
+    chat_template=None,
+    supervised_assistant_indices=None,
+):
     """渲染一条轨迹，并只保留 assistant 回合对应的训练标签。
 
     每个 assistant 回合分别渲染「此前消息 + generation prompt」与「包含该回合的
@@ -77,11 +83,28 @@ def build_supervised_example(messages, tools, tokenizer, max_length=8192, chat_t
         return None
     # assistant_indices 指向“消息级”位置；稍后还要用 chat template 把它映射成
     # token 级 [start, end) 区间。一个轨迹可以包含多个 assistant/tool 往返。
-    assistant_indices = [
+    all_assistant_indices = [
         index
         for index, message in enumerate(rendered_messages)
         if message.get("role") == "assistant"
     ]
+    if supervised_assistant_indices is None:
+        assistant_indices = all_assistant_indices
+    else:
+        try:
+            requested_indices = {
+                int(index) for index in supervised_assistant_indices
+            }
+        except (TypeError, ValueError):
+            return None
+        if (
+            not requested_indices
+            or not requested_indices.issubset(set(all_assistant_indices))
+        ):
+            return None
+        assistant_indices = [
+            index for index in all_assistant_indices if index in requested_indices
+        ]
     if not assistant_indices:
         return None
 
@@ -95,7 +118,7 @@ def build_supervised_example(messages, tools, tokenizer, max_length=8192, chat_t
             add_generation_prompt=False,
         )
         input_ids = _token_ids(tokenizer, full_text)
-    except Exception:
+    except Exception:  # noqa: BLE001 - third-party templates raise varied errors.
         return None
     if len(input_ids) > int(max_length):
         return None
@@ -118,7 +141,7 @@ def build_supervised_example(messages, tools, tokenizer, max_length=8192, chat_t
             )
             prefix_ids = _token_ids(tokenizer, prefix_text)
             through_assistant_ids = _token_ids(tokenizer, through_assistant_text)
-        except Exception:
+        except Exception:  # noqa: BLE001 - third-party templates raise varied errors.
             return None
 
         # 部分 chat template 的 generation prompt 与实际 assistant 起始 token 会有
@@ -167,6 +190,9 @@ def load_supervised_examples(path, tokenizer, max_length=8192, chat_template=Non
                 tokenizer=tokenizer,
                 max_length=max_length,
                 chat_template=chat_template,
+                supervised_assistant_indices=row.get(
+                    "supervised_assistant_indices"
+                ),
             )
         except (KeyError, TypeError, json.JSONDecodeError):
             example = None
@@ -194,7 +220,7 @@ def split_rows_by_task(rows, validation_ratio=0.05, seed=42):
         return list(rows), []
 
     def stable_key(task_id):
-        value = f"{seed}:{task_id}".encode("utf-8")
+        value = f"{seed}:{task_id}".encode()
         return hashlib.sha256(value).hexdigest()
 
     ordered_ids = sorted(task_ids, key=stable_key)

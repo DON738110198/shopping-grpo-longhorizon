@@ -1,8 +1,8 @@
 """验证 SFT 训练样本的 assistant-only loss mask。"""
 
-import unittest
 import json
 import tempfile
+import unittest
 from pathlib import Path
 
 from shopping_grpo.training.sft.dataset import (
@@ -111,6 +111,60 @@ class SftTrainingTest(unittest.TestCase):
         self.assertIn("[tool=buy_now]", labeled)
         self.assertNotIn("buy a pillow", labeled)
         self.assertNotIn("search result: item-1", labeled)
+
+    def test_recovery_row_can_supervise_only_selected_assistant_turns(self):
+        messages = [
+            {"role": "user", "content": "buy a pillow"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "search_products",
+                            "arguments": '{"query":"pillow"}',
+                        }
+                    }
+                ],
+            },
+            {"role": "tool", "content": "one matching pillow"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "buy_now", "arguments": "{}"}}
+                ],
+            },
+        ]
+
+        example = build_supervised_example(
+            messages=messages,
+            tools=[{"type": "function"}],
+            tokenizer=CharacterTokenizer(),
+            max_length=1_000,
+            supervised_assistant_indices=[3],
+        )
+
+        self.assertIsNotNone(example)
+        labeled = CharacterTokenizer.decode(
+            token for token in example["labels"] if token != IGNORE_INDEX
+        )
+        self.assertNotIn("[tool=search_products]", labeled)
+        self.assertIn("[tool=buy_now]", labeled)
+
+    def test_recovery_row_rejects_non_assistant_supervision_index(self):
+        example = build_supervised_example(
+            messages=[
+                {"role": "user", "content": "buy"},
+                {"role": "assistant", "content": "purchase"},
+            ],
+            tools=[],
+            tokenizer=CharacterTokenizer(),
+            max_length=1_000,
+            supervised_assistant_indices=[0],
+        )
+
+        self.assertIsNone(example)
 
     def test_overlong_trajectory_is_dropped_instead_of_truncated(self):
         """长轨迹不能截断后保留，否则可能只留下半个 tool call。"""
