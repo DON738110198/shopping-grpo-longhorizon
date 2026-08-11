@@ -6,6 +6,8 @@ import os
 import unittest
 from unittest.mock import patch
 
+from omegaconf import OmegaConf
+
 from scripts.check_grpo_runtime import compose_runtime_config
 
 
@@ -31,6 +33,18 @@ class DapoConfigTest(unittest.TestCase):
         self.assertFalse(config.algorithm.use_kl_in_reward)
         self.assertFalse(config.actor_rollout_ref.actor.use_kl_loss)
         self.assertTrue(config.shopping_dynamic_sampling.enable)
+
+        with patch.dict(os.environ, {"GRPO_CONFIG_NAME": "grpo"}):
+            grpo_config = compose_runtime_config([])
+
+        dapo_payload = OmegaConf.to_container(config, resolve=False)
+        grpo_payload = OmegaConf.to_container(grpo_config, resolve=False)
+        dapo_payload.pop("shopping_dapo")
+        dapo_actor = dapo_payload["actor_rollout_ref"]["actor"]
+        grpo_actor = grpo_payload["actor_rollout_ref"]["actor"]
+        dapo_actor["clip_ratio_high"] = grpo_actor["clip_ratio_high"]
+        dapo_actor["clip_ratio_c"] = grpo_actor["clip_ratio_c"]
+        self.assertEqual(dapo_payload, grpo_payload)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,43 +1,152 @@
-# DAPO-derived Shopping Agent pilot.
+# Shopping Agent DAPO Clip-Higher pilot configuration.
 #
-# GRPO V2 already supplies three parts of the DAPO recipe: reward-varying
-# dynamic sampling, token-level policy-loss aggregation and no KL penalty.
-# This first pilot isolates DAPO's clipping recipe so the comparison against
-# the 25-update GRPO P0 pilot stays interpretable:
-#   1. Clip-Higher: upper PPO clip 0.20 -> 0.28, lower clip stays 0.20.
-#   2. The DAPO dual-clip ceiling is made explicit at 10.0.
+# This is a standalone Hydra config because hydra.searchpath may only be set by
+# the primary config. It intentionally matches grpo.yaml except for the DAPO
+# clipping recipe and the audit-only shopping_dapo metadata below.
 #
-# Reward standard-deviation normalization remains off. Shopping policy rewards
-# contain intentional 0.02/0.03 behavior differences; normalizing a small-
-# variance group would amplify those differences and confound this first test.
-#
-# The paper's soft overlong penalty is not copied mechanically. In this
-# multi-turn environment response length includes ShopSimulator observations,
-# so a token-count penalty would also punish environment text the Actor did not
-# generate. Existing policy-reward negatives for max_steps and context limits
-# remain active and auditable instead.
-
+# 一次默认训练更新的数据规模：
+#   2 个 prompt/task（train_batch_size）x 每题 4 条 rollout（rollout.n）= 8 条轨迹。
+# 同一 task 的 4 条轨迹组成一个 GRPO group，用组内奖励差构造相对 advantage。
+# dynamic sampling 最多额外生成 3 个 batch，直到找到 reward 有差异且可验证的 group。
 hydra:
-  # Search paths are consumed while Hydra expands the defaults tree, before
-  # grpo.yaml itself is merged, so the derived config must repeat this entry.
   searchpath:
     - pkg://verl/trainer/config
 
 defaults:
-  - grpo
+  - ppo_trainer
   - _self_
 
+data:
+  train_files: ${oc.env:GRPO_TRAIN_FILE}
+  val_files: ${oc.env:GRPO_VAL_FILE}
+  train_batch_size: 2
+  val_batch_size: 2
+  # 4096 + 20480 = 24576，必须与 rollout/actor/ref 的 token 上限一致。
+  # truncation=error 表示宁可拒绝超长样本，也不截断半个 tool call 或 observation。
+  max_prompt_length: 4096
+  max_response_length: 20480
+  return_raw_chat: true
+  filter_overlong_prompts: true
+  truncation: error
+  seed: 42
+
 actor_rollout_ref:
+  model:
+    # 这里读取 sft.sh 合并后的完整 checkpoint；GRPO 再挂一套新的 LoRA，
+    # 不会继续修改 SFT adapter 文件。
+    path: ${oc.env:GRPO_MODEL_PATH}
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+    use_remove_padding: false
+    lora_rank: 16
+    lora_alpha: 32
+    target_modules: all-linear
+    lora:
+      merge: true
+    override_config:
+      attn_implementation: sdpa
   actor:
+    # mini batch 2 指 prompt 维度；真实前向 micro batch 固定为每卡 1 条长序列。
+    # ppo_max_token_len_per_gpu 是显式显存护栏，禁止因 dynamic batch 悄悄放大。
+    ppo_mini_batch_size: 2
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_max_token_len_per_gpu: 24576
+    use_dynamic_bsz: false
+    data_loader_seed: 42
+    freeze_vision_tower: true
+    # token-mean：先在所有有效 response token 上聚合 policy loss；padding/tool 输入
+    # 是否参与由 veRL 的 response mask 决定。
+    loss_agg_mode: token-mean
+    # DAPO Clip-Higher keeps the lower ratio at 0.8 while allowing beneficial
+    # updates up to 1.28. clip_ratio_c=10 makes DAPO's dual-clip ceiling explicit.
     clip_ratio_low: 0.20
     clip_ratio_high: 0.28
     clip_ratio_c: 10.0
-    loss_agg_mode: token-mean
+    entropy_coeff: 0.0
+    calculate_entropy: false
+    # 当前配方不在 actor loss 中加入显式 reference KL 项。
+    use_kl_loss: false
+    kl_loss_coef: 0.0
+    kl_loss_type: low_var_kl
+    optim:
+      lr: 1.0e-6
+      lr_warmup_steps_ratio: 0.03
+    fsdp_config:
+      seed: 42
+      optimizer_offload: true
+      param_offload: true
+  rollout:
+    # vLLM async workers 与 ShopSimulator 并发交互。n=4 是每道题采样的候选轨迹数，
+    # temperature=0.7 提供组内差异；若 4 条奖励全相同，该 group 无 GRPO 排序信号。
+    name: vllm
+    mode: async
+    n: 4
+    temperature: 0.7
+    top_p: 0.9
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.45
+    max_num_seqs: 8
+    max_model_len: 24576
+    max_num_batched_tokens: 24576
+    free_cache_engine: true
+    calculate_log_probs: true
+    engine_kwargs:
+      vllm:
+        seed: 42
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_max_token_len_per_gpu: 24576
+    log_prob_use_dynamic_bsz: false
+    agent:
+      # worker 是并发执行 AgentLoop 的协程/进程容量，不等于 rollout.n。
+      num_workers: 8
+      default_agent_loop: shopping_tool_agent
+      agent_loop_config_path: ${oc.env:SHOPPING_GRPO_ROOT}/configs/agent_loop.yaml
+    multi_turn:
+      # 每轮只允许一个 tool call；模型输出 -> 工具 -> observation 会重复多轮。
+      # 40 是框架护栏，业务环境仍由 max_steps=35 更早终止。
+      enable: true
+      format: qwen3_coder
+      max_user_turns: 40
+      max_assistant_turns: 40
+      max_parallel_calls: 1
+      max_tool_response_length: 16384
+      tool_response_truncate_side: middle
+      tool_config_path: ${oc.env:SHOPPING_GRPO_ROOT}/configs/tools.json
+      tokenization_sanity_check_mode: ignore_strippable
+    val_kwargs:
+      # 验证不采样，确保 save/test 间的指标变化主要来自 checkpoint，而不是随机解码。
+      n: 1
+      temperature: 0.0
+      top_p: 1.0
+      do_sample: false
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_max_token_len_per_gpu: 24576
+    log_prob_use_dynamic_bsz: false
+    fsdp_config:
+      seed: 42
+      param_offload: true
 
 algorithm:
+  # 对同一 prompt 的 K 条轨迹，GRPO 用相对回报形成 advantage。此配方关闭标准差
+  # 归一化，因此保留原始组内奖励差的尺度；constant-reward group 会被动态采样丢弃。
   adv_estimator: grpo
-  norm_adv_by_std_in_grpo: false
   use_kl_in_reward: false
+  norm_adv_by_std_in_grpo: false
+  rollout_correction:
+    bypass_mode: true
+    rollout_is: null
+    rollout_rs: null
+    loss_type: ppo_clip
+
+shopping_dynamic_sampling:
+  # 任何一条轨迹基础设施无效/奖励不可验证时整组丢弃；合法但奖励恒定的组也丢弃。
+  # 连续 10 次更新都找不到有效组时停止，避免无限消耗环境 rollout。
+  enable: true
+  metric: seq_reward
+  max_num_gen_batches: 3
+  max_consecutive_skipped_updates: 10
+  reward_tolerance: 1.0e-8
 
 shopping_dapo:
   variant: dapo-clip-higher-pilot-v1
@@ -46,3 +155,27 @@ shopping_dapo:
   token_level_policy_gradient: true
   reward_std_normalization: false
   soft_overlong_reward: false
+
+reward_model:
+  enable: false
+
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      worker_process_setup_hook: shopping_grpo.training.grpo.compat.install_torch_padding_fallback
+
+trainer:
+  # total_training_steps 优先形成硬上限；每 50 个参数更新步保存并跑一次确定性验证。
+  total_epochs: 50
+  total_training_steps: 500
+  save_freq: 50
+  test_freq: 50
+  val_before_train: true
+  logger: [console]
+  project_name: shopping-grpo
+  experiment_name: shopping-agent-grpo
+  default_local_dir: ${oc.env:GRPO_OUTPUT_DIR}
+  rollout_data_dir: ${oc.env:GRPO_OUTPUT_DIR}/rollouts
+  validation_data_dir: ${oc.env:GRPO_OUTPUT_DIR}/validation
+  n_gpus_per_node: 1
+  nnodes: 1
