@@ -1454,6 +1454,7 @@ class NestedContinuationCollectorTest(unittest.TestCase):
         continuations_per_decision=4,
         state_count=1,
         long_prompt=False,
+        env_factory=FakeEnvironment,
     ):
         actor = Path(root)
         (actor / "weights.bin").write_bytes(b"weights")
@@ -1502,7 +1503,7 @@ class NestedContinuationCollectorTest(unittest.TestCase):
             completion_client=AlwaysBuyClient(),
             parser=FakeParser(),
             encoder=encoder or FakeEncoder(),
-            env_factory=FakeEnvironment,
+            env_factory=env_factory,
             tool_schemas=SHOP_TOOL_SCHEMAS,
             required_environment_version="shopsimulator-environment-v2.1",
             continuations_per_decision=continuations_per_decision,
@@ -1748,6 +1749,8 @@ class NestedContinuationCollectorTest(unittest.TestCase):
                         item["downstream_request_seeds"] == []
                         and item["first_downstream_seed"] is None
                         and item["model_failure"]
+                        and not item["sampling_invalid"]
+                        and not item["reward_invalid"]
                         for item in result["continuations"]
                     )
                 )
@@ -1788,6 +1791,74 @@ class NestedContinuationCollectorTest(unittest.TestCase):
         )
         self.assertEqual(len(FakeEnvironment.instances), 8)
         self.assertTrue(all(env.released for env in FakeEnvironment.instances))
+
+    def test_reward_unverifiable_is_audited_without_dropping_slots(self):
+        class OneRewardInvalidEnvironment(FakeEnvironment):
+            buy_count = 0
+
+            def step(self, action):
+                if action != "click[Buy Now]":
+                    return super().step(action)
+                self.actions.append(action)
+                self.__class__.buy_count += 1
+                if self.__class__.buy_count != 1:
+                    return {
+                        "done": True,
+                        "over": True,
+                        "reward": 1.0,
+                        "reward_detail": reward_detail(),
+                    }
+                detail = reward_detail()
+                detail.update(
+                    {
+                        "reward_type": "reward_unverifiable",
+                        "reward_valid": False,
+                        "termination_reason": "reward_unverifiable",
+                        "target_asin_match": False,
+                        "terminal_utility": 0.0,
+                        "purchase_success": False,
+                        "sampling_invalid": True,
+                    }
+                )
+                return {
+                    "done": True,
+                    "over": True,
+                    "reward": 0.0,
+                    "reward_detail": detail,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            OneRewardInvalidEnvironment.buy_count = 0
+            collector = self._collector(
+                tmp,
+                continuations_per_decision=8,
+                state_count=3,
+                env_factory=OneRewardInvalidEnvironment,
+            )
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+
+        aggregate = result["summary"]["aggregate"]
+        self.assertEqual(aggregate["continuations"], 24)
+        self.assertEqual(aggregate["reward_invalid_continuations"], 1)
+        self.assertEqual(aggregate["reward_unverifiable_continuations"], 1)
+        self.assertEqual(aggregate["sampling_invalid_continuations"], 1)
+        self.assertEqual(
+            aggregate["reward_invalid_reason_counts"], {"reward_unverifiable": 1}
+        )
+        self.assertTrue(aggregate["formal_fold_collection_passed"])
+        invalid = [item for item in result["continuations"] if item["sampling_invalid"]]
+        self.assertEqual(len(invalid), 1)
+        self.assertTrue(invalid[0]["reward_invalid"])
+        self.assertFalse(invalid[0]["infrastructure_invalid"])
+        self.assertFalse(invalid[0]["model_failure"])
+        self.assertFalse(
+            next(
+                decision
+                for decision in result["decisions"]
+                if invalid[0]["decision_uid"] == decision["decision_uid"]
+            )["credit_eligible"]
+        )
 
     def test_parser_mismatch_aborts_as_infrastructure_contract_drift(self):
         def tamper(records):

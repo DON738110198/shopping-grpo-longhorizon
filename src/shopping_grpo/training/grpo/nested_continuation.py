@@ -37,19 +37,20 @@ from shopping_grpo.training.grpo.pivotal_states import (
 )
 
 NESTED_DECISION_VERSION = "shopping-nested-decision-v1"
-NESTED_CONTINUATION_VERSION = "shopping-nested-continuation-v1"
-NESTED_COLLECTION_VERSION = "shopping-nested-continuation-collection-v1"
+NESTED_CONTINUATION_VERSION = "shopping-nested-continuation-v2"
+NESTED_COLLECTION_VERSION = "shopping-nested-continuation-collection-v2"
 NESTED_HARNESS_CONTRACT_VERSION = "shopping-nested-harness-contract-v2"
 NESTED_DECISION_CONTENT_VERSION = "shopping-nested-decision-content-v1"
 NESTED_SEED_SCHEDULE_VERSION = "shopping-nested-state-crn-seed-v1"
 NESTED_FOLD_CONTRACT_VERSION = "shopping-nested-train4-gate4-v1"
-NESTED_ROLLOUT_CONTENT_VERSION = "shopping-nested-rollout-content-v1"
+NESTED_ROLLOUT_CONTENT_VERSION = "shopping-nested-rollout-content-v2"
 NESTED_EXCLUSION_AUDIT_VERSION = _nested_structure.NESTED_EXCLUSION_AUDIT_VERSION
 
 MECHANICAL_CONTINUATIONS_PER_DECISION = 4
 FORMAL_CONTINUATIONS_PER_DECISION = 8
 TRAIN_CONTINUATION_INDICES = (0, 1, 2, 3)
 GATE_CONTINUATION_INDICES = (4, 5, 6, 7)
+MAX_SAMPLING_INVALID_RATE = 0.05
 
 
 class _ProposalStructureExclusion(ValueError):
@@ -1121,6 +1122,9 @@ class NestedContinuationCollector:
             "task_id": decision["task_id"],
             "valid_for_learning": False,
             "infrastructure_invalid": True,
+            "reward_invalid": False,
+            "reward_unverifiable": False,
+            "sampling_invalid": True,
             "infrastructure_error_code": (
                 exc.code
                 if isinstance(exc, ActiveSuffixInfrastructureError)
@@ -1230,6 +1234,21 @@ class NestedContinuationCollector:
         continuation_uid = _continuation_uid(
             decision["state_uid"], decision["decision_uid"], continuation_index
         )
+        valid_for_learning = bool(result["valid_for_learning"])
+        infrastructure_invalid = bool(result["infrastructure_invalid"])
+        model_failure = bool(result["model_failure"])
+        invalid_reason = result["invalid_reason"]
+        # Active-suffix collection may suppress an empty *new* completion because it
+        # has no local tokens. Nested replay already owns the frozen first-decision
+        # span, so the same model-attributable failure remains a trainable negative.
+        if model_failure and not infrastructure_invalid:
+            valid_for_learning = True
+            invalid_reason = None
+        reward_invalid = (
+            not valid_for_learning and not infrastructure_invalid and not model_failure
+        )
+        reward_unverifiable = reward_invalid and invalid_reason == "reward_unverifiable"
+        sampling_invalid = not valid_for_learning
         record = {
             "schema_version": NESTED_CONTINUATION_VERSION,
             "continuation_uid": continuation_uid,
@@ -1264,16 +1283,19 @@ class NestedContinuationCollector:
             "response_mask": list(result["response_mask"]),
             "old_logprobs": list(result["old_logprobs"]),
             "assistant_spans": deepcopy(result["assistant_spans"]),
-            "valid_for_learning": bool(result["valid_for_learning"]),
-            "infrastructure_invalid": bool(result["infrastructure_invalid"]),
+            "valid_for_learning": valid_for_learning,
+            "infrastructure_invalid": infrastructure_invalid,
+            "reward_invalid": reward_invalid,
+            "reward_unverifiable": reward_unverifiable,
+            "sampling_invalid": sampling_invalid,
             "infrastructure_error_code": result["infrastructure_error_code"],
             "infrastructure_error_class": result["infrastructure_error_class"],
-            "invalid_reason": result["invalid_reason"],
+            "invalid_reason": invalid_reason,
             "strict": bool(result["strict"]),
             "policy_reward": float(result["policy_reward"]),
             "terminal_utility": float(result["terminal_utility"]),
             "reward_type": result["reward_type"],
-            "model_failure": bool(result["model_failure"]),
+            "model_failure": model_failure,
             "termination_reason": result["termination_reason"],
             "harness_limit_reason": result["harness_limit_reason"],
             "steps": int(result["steps"]),
@@ -1345,11 +1367,19 @@ class NestedContinuationCollector:
             output["structurally_valid"] = all(
                 not item["infrastructure_invalid"] for item in decision_continuations
             ) and len(decision_continuations) == self.continuations_per_decision
+            output["credit_eligible"] = all(
+                item["valid_for_learning"] for item in decision_continuations
+            ) and len(decision_continuations) == self.continuations_per_decision
             decision_outputs.append(output)
 
         expected_continuations = len(self.decisions) * self.continuations_per_decision
         infrastructure_invalid = sum(
             int(item["infrastructure_invalid"]) for item in continuations
+        )
+        reward_invalid = sum(int(item["reward_invalid"]) for item in continuations)
+        sampling_invalid = sum(int(item["sampling_invalid"]) for item in continuations)
+        sampling_invalid_rate = (
+            sampling_invalid / len(continuations) if continuations else 0.0
         )
         proposal_uids = [
             source["proposal_uid"]
@@ -1425,10 +1455,28 @@ class NestedContinuationCollector:
                 "valid_decisions": sum(
                     int(item["structurally_valid"]) for item in decision_outputs
                 ),
+                "credit_eligible_decisions": sum(
+                    int(item["credit_eligible"]) for item in decision_outputs
+                ),
                 "valid_for_learning_continuations": sum(
                     int(item["valid_for_learning"]) for item in continuations
                 ),
                 "infrastructure_invalid_continuations": infrastructure_invalid,
+                "reward_invalid_continuations": reward_invalid,
+                "reward_unverifiable_continuations": sum(
+                    int(item["reward_unverifiable"]) for item in continuations
+                ),
+                "sampling_invalid_continuations": sampling_invalid,
+                "sampling_invalid_rate": sampling_invalid_rate,
+                "reward_invalid_reason_counts": dict(
+                    sorted(
+                        Counter(
+                            str(item["invalid_reason"])
+                            for item in continuations
+                            if item["reward_invalid"]
+                        ).items()
+                    )
+                ),
                 "infrastructure_error_code_counts": dict(
                     sorted(
                         Counter(
@@ -1461,13 +1509,14 @@ class NestedContinuationCollector:
                 "mechanical_collection_passed": (
                     bool(decision_outputs)
                     and cardinality_complete
-                    and infrastructure_invalid == 0
+                    and sampling_invalid_rate <= MAX_SAMPLING_INVALID_RATE
                 ),
                 "formal_fold_collection_passed": (
                     self.continuations_per_decision
                     == FORMAL_CONTINUATIONS_PER_DECISION
+                    and bool(decision_outputs)
                     and cardinality_complete
-                    and infrastructure_invalid == 0
+                    and sampling_invalid_rate <= MAX_SAMPLING_INVALID_RATE
                 ),
                 "formal_experiment_gate_passed": False,
             },

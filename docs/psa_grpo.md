@@ -265,4 +265,46 @@ goal 字段。
 准确率或 PSA-GRPO 涨点。八条 suffix 中七条成功的比例没有统计意义，也没有运行
 Final-200。
 
+## 为什么 2 x 4 还不能训练
+
+机械 smoke 中 task 10232 暴露了完整轨迹 credit 的同一个混淆：两条 suffix 的首个
+规范化工具动作都是选择 `50cm`，但一条最终严格成功、另一条以 `-0.4` 结束；它们前
+五个后续工具动作也相同，真正分叉发生在更晚的搜索与页面管理。若直接把终局 reward
+贴到首动作，两个完全相同的工具动作会得到相反监督，或者被错误聚合成负 advantage。
+
+因此 `mixed_strict` 和“首动作不同”现在都只作诊断，不能再作为训练资格。PSA 的训练
+单位也明确为完整的首个 Assistant decision turn（推理 token + 工具调用），而不是只
+截取工具名和参数 token。后者会切断前置推理 token 对动作概率的贡献，只能作为后续
+有偏 surrogate 消融。
+
+## Nested PSA 合同
+
+新增的 nested collector 把一次对照拆成两个阶段：
+
+1. Stage 1 从相同 exact branch 独立采样 `K=4` 个首 Assistant decision，并保存完整
+   token、old logprob、规范化动作、proposal multiplicity 和内容 hash；结构不可重放的
+   proposal 会按预注册规则排除整个 state，不单独丢样本，也不补采。
+2. Stage 2 对每个 exact decision 使用新环境租约，重放原 prefix 并强制执行冻结的首
+   decision；只有 post-action public state、actor prompt token 和 Harness snapshot 全部
+   一致，才从该边界采 continuation。
+3. 正式合同固定每个 decision 八条 continuation：索引 `0..3` 只用于估计训练目标，
+   `4..7` 只用于 signal gate，gate fold 永不回填到 advantage。相同 state 和 slot 在
+   不同 decision 间共用预注册随机种子，减少 continuation 噪声。
+4. `assistant_final`、并行调用、未知/畸形工具、`think`、立即购买、Guard 上限和
+   max-step 等模型行为均有显式路径；只有 token/span/logprob、环境、Reward 或 replay
+   无法验证时才是无效样本。
+
+训练侧先用 train fold 计算每个 decision 的均值与均值方差，再按同一 state 内的
+proposal multiplicity 估计组均值。可见的 continuation 噪声会从 decision 间方差中
+扣除，并用可靠度系数收缩到组均值；最后采用保持 proposal 加权零均值的有界
+advantage，不再对很小的 reward 差强行做单位标准化。每个 decision 只产生一个训练
+样本，continuation token 永远不进入该 decision 的 loss。
+
+Estimator 的纯统计入口始终输出 `training_ready=false`。只有 artifact adapter 重新核对
+actor、environment、plan、selection、Stage-1、backend、prompt/span、fresh lease、release、
+Reward 计算和 outcome-blind exclusion 后，才可能放行 optimizer。正式信号门槛至少要求
+32 个独立 task/state、state/task ESS 均不低于 32、无效率不超过 5%，并要求 gate fold
+上的 top-vs-bottom decision 差值、排序一致性、task-cluster bootstrap 和置换检验同时
+通过。未达到门槛时保留全部工件，但不进行参数更新。
+
 在这些门槛通过前，报告中的 `training_ready` 固定为 `false`，也不运行 Final-200。

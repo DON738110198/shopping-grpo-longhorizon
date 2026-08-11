@@ -17,6 +17,7 @@ from test_active_suffix import (
     FakePlanBoundClient,
     decoding_and_backend,
     resolved_branch,
+    reward_detail,
 )
 
 from scripts.estimate_nested_credit import main as estimate_credit_main
@@ -95,6 +96,10 @@ def _state(
                         "reward": reward,
                         "valid_for_learning": True,
                         "infrastructure_invalid": False,
+                        "reward_invalid": False,
+                        "reward_unverifiable": False,
+                        "sampling_invalid": False,
+                        "model_failure": False,
                         "invalid_reason": None,
                     }
                     for continuation_index, reward in enumerate(rewards)
@@ -233,6 +238,9 @@ class NestedCreditEstimatorTests(unittest.TestCase):
                 "reward": None,
                 "valid_for_learning": False,
                 "infrastructure_invalid": True,
+                "reward_invalid": False,
+                "reward_unverifiable": False,
+                "sampling_invalid": True,
                 "invalid_reason": "token_alignment_invalid",
             }
         )
@@ -245,6 +253,28 @@ class NestedCreditEstimatorTests(unittest.TestCase):
             "incomplete_valid_train_fold",
             estimated["structural_gate"]["failed_checks"],
         )
+        self.assertEqual(estimated["decision_values"], [])
+
+    def test_reward_unverifiable_slot_is_counted_but_never_enters_credit(self) -> None:
+        state = _state(0, [[0.0] * 8, [0.0] * 8], [0, 0, 1, 1])
+        continuation = state["decisions"][0]["continuations"][0]
+        continuation.update(
+            {
+                "reward": None,
+                "valid_for_learning": False,
+                "reward_invalid": True,
+                "reward_unverifiable": True,
+                "sampling_invalid": True,
+                "invalid_reason": "reward_unverifiable",
+            }
+        )
+
+        result = estimate_nested_decision_credit(_payload([state]))
+
+        estimated = result["states"][0]
+        self.assertFalse(estimated["structural_gate"]["eligible_for_credit"])
+        self.assertEqual(estimated["reward_invalid_continuations"], 1)
+        self.assertEqual(estimated["sampling_invalid_continuations"], 1)
         self.assertEqual(estimated["decision_values"], [])
         self.assertIsNone(estimated["heldout_diagnostic"])
 
@@ -370,6 +400,7 @@ class NestedCollectionAdapterTests(unittest.TestCase):
         continuations_per_decision: int = 4,
         stage1_mutator=None,
         stage1_client=None,
+        env_factory=FakeEnvironment,
     ):
         (root / "weights.bin").write_bytes(b"weights")
         actor_sha = sha256_actor_checkpoint(root)
@@ -408,7 +439,7 @@ class NestedCollectionAdapterTests(unittest.TestCase):
             completion_client=AlwaysBuyClient(),
             parser=FakeParser(),
             encoder=FakeEncoder(),
-            env_factory=FakeEnvironment,
+            env_factory=env_factory,
             tool_schemas=SHOP_TOOL_SCHEMAS,
             required_environment_version="shopsimulator-environment-v2.1",
             expected_proposals=len(resolved) * suffixes_per_state,
@@ -545,10 +576,85 @@ class NestedCollectionAdapterTests(unittest.TestCase):
             continuation.pop("rollout_content_sha256")
             continuation.update(_with_rollout_content_sha256(continuation))
 
-            with self.assertRaisesRegex(
-                ValueError, "infrastructure-invalid continuation reward contract mismatch"
-            ):
+            with self.assertRaisesRegex(ValueError, "sampling-invalid flag mismatch"):
                 self._estimate(tampered, root, plan, resolved, stage1, backend)
+
+    def test_adapter_rejects_discarding_a_model_failure_as_sampling_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collection, plan, resolved, stage1, backend = self._artifacts(root)
+            tampered = copy.deepcopy(collection)
+            continuation = tampered["continuations"][0]
+            continuation.update(
+                {
+                    "valid_for_learning": False,
+                    "sampling_invalid": True,
+                    "model_failure": True,
+                    "invalid_reason": "assistant_finished_without_environment_done",
+                }
+            )
+            continuation.pop("rollout_content_sha256")
+            continuation.update(_with_rollout_content_sha256(continuation))
+
+            with self.assertRaisesRegex(ValueError, "must remain learning-valid"):
+                self._estimate(tampered, root, plan, resolved, stage1, backend)
+
+    def test_attested_reward_unverifiable_is_excluded_from_q_not_rejected(self) -> None:
+        class OneRewardInvalidEnvironment(FakeEnvironment):
+            buy_count = 0
+
+            def step(self, action):
+                if action != "click[Buy Now]":
+                    return super().step(action)
+                self.actions.append(action)
+                self.__class__.buy_count += 1
+                detail = reward_detail()
+                if self.__class__.buy_count == 1:
+                    detail.update(
+                        {
+                            "reward_type": "reward_unverifiable",
+                            "reward_valid": False,
+                            "termination_reason": "reward_unverifiable",
+                            "target_asin_match": False,
+                            "terminal_utility": 0.0,
+                            "purchase_success": False,
+                            "sampling_invalid": True,
+                        }
+                    )
+                    return {
+                        "done": True,
+                        "over": True,
+                        "reward": 0.0,
+                        "reward_detail": detail,
+                    }
+                return {
+                    "done": True,
+                    "over": True,
+                    "reward": 1.0,
+                    "reward_detail": detail,
+                }
+
+        resolved = [resolved_branch(task_id, [10, 20]) for task_id in (17, 18, 19)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            OneRewardInvalidEnvironment.buy_count = 0
+            collection, plan, resolved, stage1, backend = self._artifacts(
+                root,
+                resolved_rows=resolved,
+                continuations_per_decision=8,
+                env_factory=OneRewardInvalidEnvironment,
+            )
+            report = self._estimate(collection, root, plan, resolved, stage1, backend)
+
+        self.assertTrue(report["source_attestation"]["attested"])
+        self.assertEqual(
+            report["training_gate"]["observed"]["reward_invalid_continuations"], 1
+        )
+        affected = next(
+            state for state in report["states"] if state["reward_invalid_continuations"]
+        )
+        self.assertFalse(affected["structural_gate"]["eligible_for_credit"])
+        self.assertEqual(affected["decision_values"], [])
 
     def test_exclusion_audit_is_recomputed_not_trusted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -764,11 +870,13 @@ class NestedCreditContractTests(unittest.TestCase):
                 "reward": None,
                 "valid_for_learning": False,
                 "infrastructure_invalid": False,
+                "sampling_invalid": True,
+                "model_failure": True,
                 "invalid_reason": "assistant_finished",
             }
         )
 
-        with self.assertRaisesRegex(ValueError, "model-attributable failures"):
+        with self.assertRaisesRegex(ValueError, "must remain learning-valid"):
             validate_nested_samples(tampered)
 
     def test_rejects_non_finite_or_out_of_contract_reward(self) -> None:

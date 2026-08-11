@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import random
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
@@ -65,13 +66,13 @@ from shopping_grpo.training.grpo.pivotal_states import (
     token_ids_sha256,
 )
 
-NESTED_SAMPLES_VERSION = "shopping-psa-nested-samples-v2"
-NESTED_CREDIT_VERSION = "shopping-psa-nested-decision-credit-v2"
-NESTED_ESTIMATOR_VERSION = "shopping-psa-nested-shrinkage-v2"
-NESTED_HELDOUT_VERSION = "shopping-psa-train4-gate4-v2"
-NESTED_TRAINING_GATE_VERSION = "shopping-psa-nested-training-gate-v2"
-NESTED_SIGNAL_GATE_VERSION = "shopping-psa-nested-signal-gate-v2"
-NESTED_RESAMPLING_VERSION = "shopping-psa-task-cluster-resampling-v2"
+NESTED_SAMPLES_VERSION = "shopping-psa-nested-samples-v3"
+NESTED_CREDIT_VERSION = "shopping-psa-nested-decision-credit-v3"
+NESTED_ESTIMATOR_VERSION = "shopping-psa-nested-shrinkage-v3"
+NESTED_HELDOUT_VERSION = "shopping-psa-train4-gate4-v3"
+NESTED_TRAINING_GATE_VERSION = "shopping-psa-nested-training-gate-v3"
+NESTED_SIGNAL_GATE_VERSION = "shopping-psa-nested-signal-gate-v3"
+NESTED_RESAMPLING_VERSION = "shopping-psa-task-cluster-resampling-v3"
 NESTED_SOURCE_ATTESTATION_VERSION = "shopping-psa-nested-source-attestation-v1"
 
 NESTED_SEED_SCHEDULE_VERSION = COLLECTOR_SEED_SCHEDULE_VERSION
@@ -82,7 +83,7 @@ FORMAL_CONTINUATIONS_PER_DECISION = COLLECTOR_FORMAL_CONTINUATIONS
 MIN_PROPOSALS_PER_STATE = 4
 MIN_DISTINCT_DECISIONS = 2
 MIN_CONTINUATIONS_PER_DECISION = 4
-MAX_INFRASTRUCTURE_INVALID_RATE = 0.05
+MAX_SAMPLING_INVALID_RATE = 0.05
 MIN_TRAINING_STATES = 32
 MIN_STATE_ESS = 32.0
 MIN_TRAINING_TASKS = 32
@@ -121,6 +122,10 @@ _CONTINUATION_FIELDS = {
     "reward",
     "valid_for_learning",
     "infrastructure_invalid",
+    "reward_invalid",
+    "reward_unverifiable",
+    "sampling_invalid",
+    "model_failure",
     "invalid_reason",
 }
 _SOURCE_ATTESTATION_FIELDS = {
@@ -445,6 +450,10 @@ def validate_nested_samples(payload: Mapping[str, object]) -> dict[str, object]:
 
                 valid = raw_continuation.get("valid_for_learning")
                 infrastructure_invalid = raw_continuation.get("infrastructure_invalid")
+                reward_invalid = raw_continuation.get("reward_invalid")
+                reward_unverifiable = raw_continuation.get("reward_unverifiable")
+                sampling_invalid = raw_continuation.get("sampling_invalid")
+                model_failure = raw_continuation.get("model_failure")
                 generation_mode = raw_continuation.get("generation_mode")
                 if generation_mode not in {
                     "sampled_continuation",
@@ -453,9 +462,31 @@ def validate_nested_samples(payload: Mapping[str, object]) -> dict[str, object]:
                     "infrastructure_invalid",
                 }:
                     raise ValueError("continuation generation_mode is invalid")
-                if not isinstance(valid, bool) or not isinstance(infrastructure_invalid, bool):
+                if not all(
+                    isinstance(value, bool)
+                    for value in (
+                        valid,
+                        infrastructure_invalid,
+                        reward_invalid,
+                        reward_unverifiable,
+                        sampling_invalid,
+                        model_failure,
+                    )
+                ):
                     raise TypeError("continuation validity fields must be boolean")
                 invalid_reason = raw_continuation.get("invalid_reason")
+                if sampling_invalid is not (not valid):
+                    raise ValueError("sampling_invalid must equal not valid_for_learning")
+                if reward_invalid and (infrastructure_invalid or model_failure):
+                    raise ValueError("reward-invalid continuation category is inconsistent")
+                if model_failure and (not valid or sampling_invalid):
+                    raise ValueError(
+                        "model-attributable failures must remain learning-valid"
+                    )
+                if reward_unverifiable is not (
+                    reward_invalid and invalid_reason == "reward_unverifiable"
+                ):
+                    raise ValueError("reward_unverifiable category is inconsistent")
                 if valid:
                     if generation_mode == "sampled_continuation" and not request_seeds:
                         raise ValueError(
@@ -471,28 +502,37 @@ def validate_nested_samples(payload: Mapping[str, object]) -> dict[str, object]:
                     if generation_mode == "infrastructure_invalid":
                         raise ValueError("learning-valid continuation has invalid mode")
                     reward = _finite_reward(raw_continuation.get("reward"), "reward")
-                    if infrastructure_invalid or invalid_reason is not None:
+                    if (
+                        infrastructure_invalid
+                        or reward_invalid
+                        or reward_unverifiable
+                        or sampling_invalid
+                        or invalid_reason is not None
+                    ):
                         raise ValueError(
-                            "learning-valid continuation cannot be infrastructure-invalid"
+                            "learning-valid continuation cannot be sampling-invalid"
                         )
                 else:
                     reward = None
                     if raw_continuation.get("reward") is not None:
                         raise ValueError("learning-invalid continuation cannot carry a reward")
-                    if not infrastructure_invalid:
+                    if infrastructure_invalid:
+                        if reward_invalid or generation_mode != "infrastructure_invalid":
+                            raise ValueError("infrastructure-invalid continuation mode mismatch")
+                    elif reward_invalid:
+                        if generation_mode == "infrastructure_invalid":
+                            raise ValueError("reward-invalid continuation mode mismatch")
+                    else:
                         raise ValueError(
-                            "model-attributable failures must remain learning-valid; "
-                            "only infrastructure failures may be invalid"
+                            "learning-invalid continuation lacks an auditable invalid category"
                         )
-                    if generation_mode != "infrastructure_invalid":
-                        raise ValueError("learning-invalid continuation mode mismatch")
                     if (
                         not isinstance(invalid_reason, str)
                         or not invalid_reason
                         or len(invalid_reason) > 128
                     ):
                         raise ValueError(
-                            "infrastructure-invalid continuation needs a bounded invalid_reason"
+                            "sampling-invalid continuation needs a bounded invalid_reason"
                         )
                 normalized_continuations.append(
                     {
@@ -505,6 +545,10 @@ def validate_nested_samples(payload: Mapping[str, object]) -> dict[str, object]:
                         "reward": reward,
                         "valid_for_learning": valid,
                         "infrastructure_invalid": infrastructure_invalid,
+                        "reward_invalid": reward_invalid,
+                        "reward_unverifiable": reward_unverifiable,
+                        "sampling_invalid": sampling_invalid,
+                        "model_failure": model_failure,
                         "invalid_reason": invalid_reason,
                     }
                 )
@@ -862,6 +906,8 @@ def _estimate_nested_decision_credit(
     eligible_task_weights: dict[int, float] = {}
     high_kappa_states = 0
     infrastructure_invalid = 0
+    reward_invalid = 0
+    sampling_invalid = 0
     continuation_slots = 0
     heldout_rows: list[dict[str, object]] = []
 
@@ -879,6 +925,8 @@ def _estimate_nested_decision_credit(
         valid_train_counts: dict[str, int] = {}
         valid_gate_counts: dict[str, int] = {}
         state_infrastructure_invalid = 0
+        state_reward_invalid = 0
+        state_sampling_invalid = 0
         for decision in decisions:
             continuations = decision["continuations"]
             valid_train_counts[decision["decision_uid"]] = sum(
@@ -895,10 +943,21 @@ def _estimate_nested_decision_credit(
                 bool(continuation["infrastructure_invalid"])
                 for continuation in continuations
             )
+            state_reward_invalid += sum(
+                bool(continuation["reward_invalid"])
+                for continuation in continuations
+            )
+            state_sampling_invalid += sum(
+                bool(continuation["sampling_invalid"])
+                for continuation in continuations
+            )
         state_slots = len(decisions) * continuation_count
         continuation_slots += state_slots
         infrastructure_invalid += state_infrastructure_invalid
+        reward_invalid += state_reward_invalid
+        sampling_invalid += state_sampling_invalid
         state_infrastructure_rate = state_infrastructure_invalid / state_slots
+        state_sampling_invalid_rate = state_sampling_invalid / state_slots
 
         failed_checks: list[str] = []
         if proposal_count < MIN_PROPOSALS_PER_STATE:
@@ -917,8 +976,8 @@ def _estimate_nested_decision_credit(
             for valid_count in valid_gate_counts.values()
         ):
             failed_checks.append("incomplete_valid_gate_fold")
-        if state_infrastructure_rate > MAX_INFRASTRUCTURE_INVALID_RATE:
-            failed_checks.append("state_infrastructure_invalid_rate_exceeded")
+        if state_sampling_invalid_rate > MAX_SAMPLING_INVALID_RATE:
+            failed_checks.append("state_sampling_invalid_rate_exceeded")
         eligible = not failed_checks
 
         decision_values: list[dict[str, object]] = []
@@ -1024,6 +1083,9 @@ def _estimate_nested_decision_credit(
                 "valid_gate_continuations": sum(valid_gate_counts.values()),
                 "infrastructure_invalid_continuations": state_infrastructure_invalid,
                 "infrastructure_invalid_rate": state_infrastructure_rate,
+                "reward_invalid_continuations": state_reward_invalid,
+                "sampling_invalid_continuations": state_sampling_invalid,
+                "sampling_invalid_rate": state_sampling_invalid_rate,
                 "structural_gate": {
                     "eligible_for_credit": eligible,
                     "failed_checks": failed_checks,
@@ -1047,6 +1109,9 @@ def _estimate_nested_decision_credit(
     global_infrastructure_rate = (
         infrastructure_invalid / continuation_slots if continuation_slots else 0.0
     )
+    global_sampling_invalid_rate = (
+        sampling_invalid / continuation_slots if continuation_slots else 0.0
+    )
     training_failures: list[str] = []
     if eligible_states < MIN_TRAINING_STATES:
         training_failures.append("insufficient_eligible_states")
@@ -1056,8 +1121,8 @@ def _estimate_nested_decision_credit(
         training_failures.append("insufficient_unique_tasks")
     if task_ess < MIN_TASK_ESS:
         training_failures.append("insufficient_task_cluster_effective_sample_size")
-    if global_infrastructure_rate > MAX_INFRASTRUCTURE_INVALID_RATE:
-        training_failures.append("global_infrastructure_invalid_rate_exceeded")
+    if global_sampling_invalid_rate > MAX_SAMPLING_INVALID_RATE:
+        training_failures.append("global_sampling_invalid_rate_exceeded")
 
     identifiable = [
         row for row in heldout_rows if bool(row["train_ranking_identifiable"])
@@ -1142,7 +1207,7 @@ def _estimate_nested_decision_credit(
                 "required_formal_continuations_per_decision": (
                     FORMAL_CONTINUATIONS_PER_DECISION
                 ),
-                "maximum_infrastructure_invalid_rate": MAX_INFRASTRUCTURE_INVALID_RATE,
+                "maximum_sampling_invalid_rate": MAX_SAMPLING_INVALID_RATE,
                 "minimum_eligible_states": MIN_TRAINING_STATES,
                 "minimum_state_effective_sample_size": MIN_STATE_ESS,
                 "minimum_unique_tasks": MIN_TRAINING_TASKS,
@@ -1157,6 +1222,9 @@ def _estimate_nested_decision_credit(
                 "continuation_slots": continuation_slots,
                 "infrastructure_invalid_continuations": infrastructure_invalid,
                 "infrastructure_invalid_rate": global_infrastructure_rate,
+                "reward_invalid_continuations": reward_invalid,
+                "sampling_invalid_continuations": sampling_invalid,
+                "sampling_invalid_rate": global_sampling_invalid_rate,
             },
             "outcome_blind_structural_failed_checks": training_failures,
             "reward_dependent_signal_failed_checks": signal_gate["failed_checks"],
@@ -1281,13 +1349,30 @@ def _recompute_continuation_policy_reward(
     """Rebuild policy-v1 reward from the bound public rollout diagnostics."""
     valid = record.get("valid_for_learning")
     infrastructure_invalid = record.get("infrastructure_invalid")
+    reward_invalid = record.get("reward_invalid")
+    reward_unverifiable = record.get("reward_unverifiable")
+    sampling_invalid = record.get("sampling_invalid")
     strict = record.get("strict")
     model_failure = record.get("model_failure")
     if not all(
         isinstance(value, bool)
-        for value in (valid, infrastructure_invalid, strict, model_failure)
+        for value in (
+            valid,
+            infrastructure_invalid,
+            reward_invalid,
+            reward_unverifiable,
+            sampling_invalid,
+            strict,
+            model_failure,
+        )
     ):
         raise TypeError("nested continuation reward flags must be boolean")
+    if sampling_invalid is not (not valid):
+        raise ValueError("nested continuation sampling-invalid flag mismatch")
+    if reward_invalid and (infrastructure_invalid or model_failure):
+        raise ValueError("nested continuation reward-invalid category mismatch")
+    if model_failure and (not valid or sampling_invalid):
+        raise ValueError("model-attributable failures must remain learning-valid")
     policy_reward = _finite_reward(record.get("policy_reward"), "policy_reward")
     terminal_utility = _finite_reward(
         record.get("terminal_utility"), "terminal_utility"
@@ -1300,40 +1385,99 @@ def _recompute_continuation_policy_reward(
         error_code = record.get("infrastructure_error_code")
         error_class = record.get("infrastructure_error_class")
         invalid_reason = record.get("invalid_reason")
-        if (
-            not infrastructure_invalid
-            or record.get("generation_mode") != "infrastructure_invalid"
-            or strict
-            or model_failure
-            or policy_reward != 0.0
-            or terminal_utility != 0.0
-            or termination_reason != "nested_continuation_infrastructure_invalid"
-            or not isinstance(error_code, str)
-            or not error_code
-            or len(error_code) > 128
-            or not isinstance(error_class, str)
-            or not error_class
-            or len(error_class) > 128
-            or invalid_reason != "nested_continuation_infrastructure_error"
-        ):
-            raise ValueError("infrastructure-invalid continuation reward contract mismatch")
-        breakdown = reward_breakdown(
-            {
-                "infrastructure_invalid": True,
-                "termination_reason": termination_reason,
-                "error": invalid_reason,
-            },
-            policy_config,
-        )
-        if (
-            breakdown["valid_for_learning"] is not False
-            or breakdown["infrastructure_invalid"] is not True
-            or float(breakdown["total"]) != policy_reward
-        ):
-            raise ValueError("infrastructure-invalid reward recomputation mismatch")
-        return None
+        if not isinstance(invalid_reason, str) or not invalid_reason:
+            raise ValueError("sampling-invalid continuation lacks a bounded reason")
+        if infrastructure_invalid:
+            if (
+                reward_invalid
+                or reward_unverifiable
+                or record.get("generation_mode") != "infrastructure_invalid"
+                or strict
+                or model_failure
+                or policy_reward != 0.0
+                or terminal_utility != 0.0
+                or termination_reason != "nested_continuation_infrastructure_invalid"
+                or not isinstance(error_code, str)
+                or not error_code
+                or len(error_code) > 128
+                or not isinstance(error_class, str)
+                or not error_class
+                or len(error_class) > 128
+                or invalid_reason != "nested_continuation_infrastructure_error"
+            ):
+                raise ValueError(
+                    "infrastructure-invalid continuation reward contract mismatch"
+                )
+            breakdown = reward_breakdown(
+                {
+                    "infrastructure_invalid": True,
+                    "termination_reason": termination_reason,
+                    "error": invalid_reason,
+                },
+                policy_config,
+            )
+            if (
+                breakdown["valid_for_learning"] is not False
+                or breakdown["infrastructure_invalid"] is not True
+                or float(breakdown["total"]) != policy_reward
+            ):
+                raise ValueError("infrastructure-invalid reward recomputation mismatch")
+            return None
 
-    if infrastructure_invalid or record.get("invalid_reason") is not None:
+        if error_code is not None or error_class is not None:
+            raise ValueError("non-infrastructure invalid continuation carries infra errors")
+        if record.get("generation_mode") == "infrastructure_invalid" or strict:
+            raise ValueError("non-infrastructure invalid continuation contract mismatch")
+        if reward_invalid:
+            if model_failure or policy_reward != 0.0:
+                raise ValueError("reward-invalid continuation reward contract mismatch")
+            if reward_unverifiable:
+                if (
+                    invalid_reason != "reward_unverifiable"
+                    or record.get("reward_type") != "reward_unverifiable"
+                    or termination_reason != "reward_unverifiable"
+                ):
+                    raise ValueError("reward-unverifiable continuation identity mismatch")
+                state = {
+                    "done": True,
+                    "terminal_result": {"done": True, "over": True},
+                    "infrastructure_invalid": False,
+                    "final_reward": terminal_utility,
+                    "reward_version": "shopsimulator-reward-v3",
+                    "reward_valid": False,
+                    "reward_type": "reward_unverifiable",
+                    "termination_reason": termination_reason,
+                }
+            else:
+                if record.get("reward_type") is not None:
+                    raise ValueError("nonterminal reward-invalid continuation has reward type")
+                state = {
+                    "done": False,
+                    "terminal_result": None,
+                    "infrastructure_invalid": False,
+                    "termination_reason": termination_reason,
+                }
+            breakdown = reward_breakdown(state, policy_config)
+            if (
+                breakdown["valid_for_learning"] is not False
+                or breakdown["infrastructure_invalid"] is not False
+                or breakdown["reward_unverifiable"] is not reward_unverifiable
+                or breakdown["model_failure"] is not False
+                or breakdown["invalid_reason"] != invalid_reason
+                or float(breakdown["total"]) != policy_reward
+            ):
+                raise ValueError("reward-invalid reward recomputation mismatch")
+            return None
+
+        raise ValueError("sampling-invalid continuation category mismatch")
+
+    if (
+        infrastructure_invalid
+        or reward_invalid
+        or reward_unverifiable
+        or sampling_invalid
+        or record.get("invalid_reason") is not None
+    ):
         raise ValueError("learning-valid continuation carries invalid diagnostics")
     if (
         record.get("infrastructure_error_code") is not None
@@ -1701,6 +1845,7 @@ def estimate_nested_collection_credit(
     seen_continuation_uids: set[str] = set()
     seen_lease_sequences: set[int] = set()
     computed_valid_decisions = 0
+    computed_credit_eligible_decisions = 0
     duplicate_semantic_rollout_count = 0
     for raw_decision in decisions:
         if not isinstance(raw_decision, Mapping):
@@ -1895,6 +2040,7 @@ def estimate_nested_collection_credit(
         normalized_continuations = []
         semantic_rollout_hash_counts: dict[str, int] = {}
         decision_infrastructure_invalid = 0
+        decision_sampling_invalid = 0
         for continuation_index, record in enumerate(raw_decision_continuations):
             if record.get("schema_version") != NESTED_CONTINUATION_VERSION:
                 raise ValueError("nested continuation version mismatch")
@@ -1945,10 +2091,24 @@ def estimate_nested_collection_credit(
             downstream_prompts = record.get("downstream_prompt_sha256")
             valid = record.get("valid_for_learning")
             infrastructure_invalid = record.get("infrastructure_invalid")
+            reward_invalid = record.get("reward_invalid")
+            reward_unverifiable = record.get("reward_unverifiable")
+            sampling_invalid = record.get("sampling_invalid")
+            model_failure = record.get("model_failure")
             generation_mode = record.get("generation_mode")
-            if not isinstance(valid, bool) or not isinstance(infrastructure_invalid, bool):
+            if not all(
+                isinstance(value, bool)
+                for value in (
+                    valid,
+                    infrastructure_invalid,
+                    reward_invalid,
+                    reward_unverifiable,
+                    sampling_invalid,
+                    model_failure,
+                )
+            ):
                 raise TypeError("nested continuation validity fields must be boolean")
-            if valid and (
+            if not infrastructure_invalid and (
                 not isinstance(downstream_prompts, list)
                 or len(downstream_prompts) != len(seeds)
                 or any(
@@ -1972,10 +2132,9 @@ def estimate_nested_collection_credit(
                 ):
                     raise ValueError("nested continuation lease is not independent")
                 seen_lease_sequences.add(lease_sequence)
-            if valid:
+            if not infrastructure_invalid:
                 if (
-                    infrastructure_invalid
-                    or generation_mode == "infrastructure_invalid"
+                    generation_mode == "infrastructure_invalid"
                     or (
                         generation_mode == "sampled_continuation"
                         and (not seeds or boundary_kind != "continuation_required")
@@ -2002,7 +2161,7 @@ def estimate_nested_collection_credit(
                     or record.get("harness_snapshot_sha256")
                     != boundary["harness_snapshot_sha256"]
                 ):
-                    raise ValueError("learning-valid continuation lacks replay/release evidence")
+                    raise ValueError("non-infrastructure continuation lacks replay/release evidence")
                 response_ids = record.get("response_ids")
                 response_mask = record.get("response_mask")
                 old_logprobs = record.get("old_logprobs")
@@ -2059,10 +2218,12 @@ def estimate_nested_collection_credit(
                 )
                 if semantic_rollout_hash_counts[semantic_hash] > 1:
                     duplicate_semantic_rollout_count += 1
-                invalid_reason = None
+                invalid_reason = None if valid else str(record.get("invalid_reason") or "")
+                if sampling_invalid:
+                    decision_sampling_invalid += 1
             else:
-                if not infrastructure_invalid or generation_mode != "infrastructure_invalid":
-                    raise ValueError("model failures must remain learning-valid")
+                if generation_mode != "infrastructure_invalid":
+                    raise ValueError("infrastructure-invalid continuation mode mismatch")
                 invalid_reason = str(record.get("invalid_reason") or "")
                 if not invalid_reason:
                     raise ValueError("infrastructure-invalid continuation lacks a reason")
@@ -2075,6 +2236,7 @@ def estimate_nested_collection_credit(
                     )
                 semantic_hash = record["rollout_content_sha256"]
                 decision_infrastructure_invalid += 1
+                decision_sampling_invalid += 1
             normalized_continuations.append(
                 {
                     "continuation_index": continuation_index,
@@ -2086,6 +2248,10 @@ def estimate_nested_collection_credit(
                     "reward": reward,
                     "valid_for_learning": valid,
                     "infrastructure_invalid": infrastructure_invalid,
+                    "reward_invalid": reward_invalid,
+                    "reward_unverifiable": reward_unverifiable,
+                    "sampling_invalid": sampling_invalid,
+                    "model_failure": model_failure,
                     "invalid_reason": invalid_reason,
                 }
             )
@@ -2094,13 +2260,19 @@ def estimate_nested_collection_credit(
             decision_infrastructure_invalid == 0
             and len(normalized_continuations) == collected_count
         )
+        computed_credit_eligible = (
+            decision_sampling_invalid == 0
+            and len(normalized_continuations) == collected_count
+        )
         if (
             raw_decision.get("continuation_uids") != continuation_uids
             or raw_decision.get("continuations_expected") != collected_count
             or raw_decision.get("structurally_valid") is not computed_structurally_valid
+            or raw_decision.get("credit_eligible") is not computed_credit_eligible
         ):
             raise ValueError("nested decision continuation summary mismatch")
         computed_valid_decisions += int(computed_structurally_valid)
+        computed_credit_eligible_decisions += int(computed_credit_eligible)
 
         state = normalized_states.setdefault(
             state_uid,
@@ -2277,11 +2449,21 @@ def estimate_nested_collection_credit(
         "continuations_per_decision": collected_count,
         "continuations": len(continuations),
         "valid_decisions": computed_valid_decisions,
+        "credit_eligible_decisions": computed_credit_eligible_decisions,
         "valid_for_learning_continuations": sum(
             int(record.get("valid_for_learning") is True) for record in continuations
         ),
         "infrastructure_invalid_continuations": sum(
             int(record.get("infrastructure_invalid") is True) for record in continuations
+        ),
+        "reward_invalid_continuations": sum(
+            int(record.get("reward_invalid") is True) for record in continuations
+        ),
+        "reward_unverifiable_continuations": sum(
+            int(record.get("reward_unverifiable") is True) for record in continuations
+        ),
+        "sampling_invalid_continuations": sum(
+            int(record.get("sampling_invalid") is True) for record in continuations
         ),
         "strict_success_continuations": sum(
             int(record.get("strict") is True) for record in continuations
@@ -2303,22 +2485,41 @@ def estimate_nested_collection_credit(
     for name, expected in expected_aggregate.items():
         if aggregate.get(name) != expected:
             raise ValueError(f"nested collection aggregate {name} mismatch")
+    expected_sampling_invalid_rate = (
+        expected_aggregate["sampling_invalid_continuations"] / len(continuations)
+        if continuations
+        else 0.0
+    )
+    expected_reward_invalid_reasons = dict(
+        sorted(
+            Counter(
+                str(record.get("invalid_reason"))
+                for record in continuations
+                if record.get("reward_invalid") is True
+            ).items()
+        )
+    )
     cardinality_complete = len(continuations) == len(decisions) * collected_count
     if (
         aggregate.get("cardinality_complete") is not cardinality_complete
         or cardinality_complete is not True
         or aggregate.get("post_action_parity_complete")
         is not (computed_valid_decisions == len(decisions))
+        or aggregate.get("sampling_invalid_rate") != expected_sampling_invalid_rate
+        or aggregate.get("reward_invalid_reason_counts")
+        != expected_reward_invalid_reasons
         or aggregate.get("mechanical_collection_passed")
         is not (
-            cardinality_complete
-            and expected_aggregate["infrastructure_invalid_continuations"] == 0
+            bool(decisions)
+            and cardinality_complete
+            and expected_sampling_invalid_rate <= MAX_SAMPLING_INVALID_RATE
         )
         or aggregate.get("formal_fold_collection_passed")
         is not (
             collected_count == FORMAL_CONTINUATIONS_PER_DECISION
+            and bool(decisions)
             and cardinality_complete
-            and expected_aggregate["infrastructure_invalid_continuations"] == 0
+            and expected_sampling_invalid_rate <= MAX_SAMPLING_INVALID_RATE
         )
     ):
         raise ValueError("nested collection aggregate gate mismatch")
