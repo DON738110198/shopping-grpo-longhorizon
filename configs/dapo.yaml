@@ -17,6 +17,12 @@
 # generate. Existing policy-reward negatives for max_steps and context limits
 # remain active and auditable instead.
 
+hydra:
+  # Search paths are consumed while Hydra expands the defaults tree, before
+  # grpo.yaml itself is merged, so the derived config must repeat this entry.
+  searchpath:
+    - pkg://verl/trainer/config
+
 defaults:
   - grpo
   - _self_
