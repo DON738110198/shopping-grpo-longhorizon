@@ -21,6 +21,7 @@ from shopping_grpo.environment.tools import SHOP_TOOL_SCHEMAS, tool_call_to_acti
 PIVOTAL_AUDIT_VERSION = "shopping-pivotal-state-audit-v1"
 REPLAY_STATE_VERSION = "shopping-public-replay-state-v1"
 TURN_SPAN_VERSION = "shopping-assistant-turn-spans-v1"
+ACTOR_PROMPT_TOKENS_VERSION = "shopping-actor-prompt-tokens-v1"
 DEFAULT_REPLAY_MAX_STEPS = 35
 _NAVIGATION_TO_SEARCH = {"search_products", "back_to_search", "next_page"}
 _PRODUCT_SUBPAGES = {

@@ -11,6 +11,7 @@ from shopping_grpo.training.grpo.dynamic_sampling import (
     extract_shopping_group_signals,
     select_reward_varying_groups,
 )
+from shopping_grpo.training.grpo.pivotal_states import token_ids_sha256
 
 
 def shopping_info(
@@ -179,6 +180,19 @@ class RewardGroupSelectionTest(unittest.TestCase):
 
     def test_sampling_audit_contains_actions_without_hidden_goal(self):
         infos = [shopping_info(-0.4, model_failure=True) for _ in range(4)]
+        prompt_tokens = [101, 102, 103]
+        infos[0]["decision_trace"] = [
+            {
+                "assistant_turn_id": 0,
+                "actor_prompt_sha256": token_ids_sha256(prompt_tokens),
+                "actor_prompt_tokens": {
+                    "version": "shopping-actor-prompt-tokens-v1",
+                    "sha256": token_ids_sha256(prompt_tokens),
+                    "count": len(prompt_tokens),
+                    "tokens": prompt_tokens,
+                },
+            }
+        ]
         _, stats = select_reward_varying_groups(
             ["a"] * 4,
             [-0.4, -0.5, -0.4, -0.4],
@@ -199,6 +213,9 @@ class RewardGroupSelectionTest(unittest.TestCase):
         self.assertEqual(record["trajectories"][0]["action_trace"][0]["tool"], "search_products")
         self.assertTrue(record["trajectories"][0]["replay_observation_v2_complete"])
         self.assertEqual(record["trajectories"][0]["turn_spans"][0]["turn_id"], 0)
+        prompt_capture = record["trajectories"][0]["decision_trace"][0]["actor_prompt_tokens"]
+        self.assertEqual(prompt_capture["tokens"], prompt_tokens)
+        self.assertEqual(prompt_capture["sha256"], token_ids_sha256(prompt_capture["tokens"]))
         self.assertNotIn("goal", json.dumps(record))
 
 

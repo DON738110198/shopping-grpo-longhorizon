@@ -19,6 +19,7 @@ from shopping_grpo.training.grpo.pivotal_states import (
     observation_sha256,
     replay_action_sha256,
     replay_state_id,
+    token_ids_sha256,
 )
 from shopping_grpo.training.grpo.pivotal_states import branch_uid as make_branch_uid
 
@@ -79,6 +80,8 @@ def make_runtime_state(task_id: int, max_steps: int) -> dict:
         "assistant_turn_records": [],
         "next_assistant_turn_id": 0,
         "current_assistant_turn_id": None,
+        "actor_prompt_token_capture_count": 0,
+        "actor_prompt_token_capture_error": None,
         "environment_manifest_sha256": None,
         "public_query_sha256": None,
         "initial_public_observation_sha256": None,
@@ -235,6 +238,34 @@ def _record_decision_event(
         "guard_reason": None,
         "error": None,
     }
+    prompt_token_candidate = turn_record.pop("_actor_prompt_token_candidate", None)
+    capture_config = state.get("_actor_prompt_token_capture_config") or {}
+    replay_state_selected = not capture_config.get("replay_state_ids") or replay_fingerprint in set(
+        capture_config.get("replay_state_ids", ())
+    )
+    if prompt_token_candidate is not None and replay_state_selected:
+        try:
+            prompt_tokens = prompt_token_candidate["tokens"]
+            if prompt_token_candidate.get("version") != capture_config.get("version"):
+                raise ValueError("capture version does not match the configured version")
+            if not isinstance(prompt_tokens, list):
+                raise TypeError("captured prompt tokens must be a list")
+            if int(prompt_token_candidate.get("count", -1)) != len(prompt_tokens):
+                raise ValueError("captured prompt token count is inconsistent")
+            captured_sha256 = token_ids_sha256(prompt_tokens)
+            if captured_sha256 != prompt_token_candidate.get("sha256"):
+                raise ValueError("captured prompt token hash is inconsistent")
+            if captured_sha256 != actor_prompt_sha256:
+                raise ValueError("captured prompt tokens do not match the decision prompt hash")
+        except (KeyError, TypeError, ValueError) as exc:
+            state["terminate"] = True
+            state["termination_reason"] = "actor_prompt_token_capture_failed"
+            state["error"] = f"actor_prompt_token_capture_failed:{exc.__class__.__name__}:{exc}"
+            state["actor_prompt_token_capture_error"] = state["error"]
+            state["infrastructure_invalid"] = True
+        else:
+            event["actor_prompt_tokens"] = prompt_token_candidate
+            state["actor_prompt_token_capture_count"] += 1
     state["decision_events"].append(event)
     del state["decision_events"][:-ACTION_TRACE_LIMIT]
     return event

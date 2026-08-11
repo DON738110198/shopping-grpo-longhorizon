@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import json
+import operator
 import os
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
@@ -34,12 +36,127 @@ from shopping_grpo.training.grpo.adapter.runtime import (
 )
 from shopping_grpo.training.grpo.adapter.session import ShopSimulatorSession
 from shopping_grpo.training.grpo.pivotal_states import (
+    ACTOR_PROMPT_TOKENS_VERSION,
     REPLAY_STATE_VERSION,
     TURN_SPAN_VERSION,
     materialize_assistant_turn_spans,
     token_ids_sha256,
     tokenizer_contract_sha256,
 )
+
+_ACTOR_PROMPT_TOKEN_CAPTURE_KEYS = {
+    "version",
+    "enabled",
+    "task_ids",
+    "decision_indices",
+    "replay_state_ids",
+    "max_events_per_trajectory",
+}
+
+
+def _integer_selector(raw: object, name: str) -> tuple[int, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise TypeError(f"actor_prompt_token_capture.{name} must be a list")
+    values = []
+    for item in raw:
+        if isinstance(item, bool):
+            raise TypeError(f"actor_prompt_token_capture.{name} must contain integers")
+        try:
+            value = operator.index(item)
+        except TypeError as exc:
+            raise TypeError(f"actor_prompt_token_capture.{name} must contain integers") from exc
+        if value < 0:
+            raise ValueError(f"actor_prompt_token_capture.{name} must be non-negative")
+        values.append(int(value))
+    return tuple(sorted(set(values)))
+
+
+def validate_actor_prompt_token_capture_config(raw_config: object = None) -> dict:
+    """Resolve the opt-in exact-prompt capture contract and reject ambiguous selectors."""
+    if raw_config is None:
+        raw_config = {}
+    if not isinstance(raw_config, Mapping):
+        raise TypeError("actor_prompt_token_capture config must be an object")
+    unknown = set(raw_config) - _ACTOR_PROMPT_TOKEN_CAPTURE_KEYS
+    if unknown:
+        raise ValueError(
+            "unknown actor_prompt_token_capture keys: " + ", ".join(sorted(map(str, unknown)))
+        )
+    version = str(raw_config.get("version", ACTOR_PROMPT_TOKENS_VERSION))
+    if version != ACTOR_PROMPT_TOKENS_VERSION:
+        raise ValueError(f"unsupported actor prompt token capture version: {version!r}")
+    enabled = raw_config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise TypeError("actor_prompt_token_capture.enabled must be boolean")
+    raw_max_events = raw_config.get("max_events_per_trajectory", 1)
+    if isinstance(raw_max_events, bool):
+        raise TypeError("actor_prompt_token_capture.max_events_per_trajectory must be an integer")
+    try:
+        max_events = operator.index(raw_max_events)
+    except TypeError as exc:
+        raise TypeError(
+            "actor_prompt_token_capture.max_events_per_trajectory must be an integer"
+        ) from exc
+    if not 1 <= max_events <= 48:
+        raise ValueError("actor_prompt_token_capture.max_events_per_trajectory must be in [1, 48]")
+    replay_state_ids = raw_config.get("replay_state_ids") or ()
+    if isinstance(replay_state_ids, (str, bytes)) or not isinstance(replay_state_ids, Sequence):
+        raise TypeError("actor_prompt_token_capture.replay_state_ids must be a list")
+    normalized_replay_state_ids = []
+    for raw_state_id in replay_state_ids:
+        state_id = str(raw_state_id)
+        if len(state_id) != 64 or any(
+            character not in "0123456789abcdef" for character in state_id
+        ):
+            raise ValueError(
+                "actor_prompt_token_capture.replay_state_ids must contain lowercase sha256 values"
+            )
+        normalized_replay_state_ids.append(state_id)
+    return {
+        "version": version,
+        "enabled": enabled,
+        "task_ids": _integer_selector(raw_config.get("task_ids"), "task_ids"),
+        "decision_indices": _integer_selector(
+            raw_config.get("decision_indices"),
+            "decision_indices",
+        ),
+        "replay_state_ids": tuple(sorted(set(normalized_replay_state_ids))),
+        "max_events_per_trajectory": int(max_events),
+    }
+
+
+_DISABLED_ACTOR_PROMPT_TOKEN_CAPTURE = validate_actor_prompt_token_capture_config()
+
+
+def _exact_actor_prompt_tokens(
+    token_ids: Sequence[object],
+    expected_sha256: str,
+) -> dict:
+    """Materialize exact integer ids and prove they match the ordinary prompt fingerprint."""
+    normalized = []
+    for token_id in token_ids:
+        if isinstance(token_id, bool):
+            raise TypeError("actor prompt token ids must be integers, not booleans")
+        try:
+            value = operator.index(token_id)
+        except TypeError as exc:
+            raise TypeError("actor prompt token ids must be integers") from exc
+        if value < 0:
+            raise ValueError("actor prompt token ids must be non-negative")
+        normalized.append(int(value))
+    if not normalized:
+        raise ValueError("actor prompt token ids must not be empty")
+    actual_sha256 = token_ids_sha256(normalized)
+    if actual_sha256 != expected_sha256:
+        raise ValueError("materialized actor prompt tokens do not match actor_prompt_sha256")
+    return {
+        "version": ACTOR_PROMPT_TOKENS_VERSION,
+        "sha256": actual_sha256,
+        "count": len(normalized),
+        "tokens": normalized,
+    }
 
 
 class ShoppingToolAgentLoop(ToolAgentLoop):
@@ -64,6 +181,7 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         observation_detail_token_budget=4096,
         observation_generic_token_budget=768,
         observation_search_top_k=20,
+        actor_prompt_token_capture=None,
         env_factory=None,
         **kwargs,
     ):
@@ -84,6 +202,9 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         self.observation_detail_token_budget = int(observation_detail_token_budget)
         self.observation_generic_token_budget = int(observation_generic_token_budget)
         self.observation_search_top_k = int(observation_search_top_k)
+        self.actor_prompt_token_capture = validate_actor_prompt_token_capture_config(
+            actor_prompt_token_capture
+        )
         maximum_context_input = (
             self.context_window_tokens
             - self.context_generation_reserve_tokens
@@ -205,6 +326,40 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             )
         prompt_fingerprint = token_ids_sha256(agent_data.prompt_ids)
         tokenizer_fingerprint = tokenizer_contract_sha256(self.tokenizer)
+        prompt_token_candidate = None
+        capture_config = getattr(
+            self,
+            "actor_prompt_token_capture",
+            _DISABLED_ACTOR_PROMPT_TOKEN_CAPTURE,
+        )
+        if runtime_state is not None:
+            runtime_state["_actor_prompt_token_capture_config"] = capture_config
+            task_selected = (
+                not capture_config["task_ids"]
+                or int(runtime_state["task_id"]) in capture_config["task_ids"]
+            )
+            decision_selected = (
+                not capture_config["decision_indices"]
+                or int(runtime_state["decision_count"]) in capture_config["decision_indices"]
+            )
+            below_limit = int(runtime_state["actor_prompt_token_capture_count"]) < int(
+                capture_config["max_events_per_trajectory"]
+            )
+            if capture_config["enabled"] and task_selected and decision_selected and below_limit:
+                try:
+                    prompt_token_candidate = _exact_actor_prompt_tokens(
+                        agent_data.prompt_ids,
+                        prompt_fingerprint,
+                    )
+                except (TypeError, ValueError) as exc:
+                    runtime_state["terminate"] = True
+                    runtime_state["termination_reason"] = "actor_prompt_token_capture_failed"
+                    runtime_state["error"] = (
+                        f"actor_prompt_token_capture_failed:{exc.__class__.__name__}:{exc}"
+                    )
+                    runtime_state["actor_prompt_token_capture_error"] = runtime_state["error"]
+                    runtime_state["infrastructure_invalid"] = True
+                    return AgentState.TERMINATED
         response_tokens_before = len(agent_data.response_mask)
         next_state = await super()._handle_generating_state(
             agent_data,
@@ -237,25 +392,27 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             tool_names = (
                 [str(tool_call.name) for tool_call in agent_data.tool_calls] if is_tool_turn else []
             )
-            runtime_state["assistant_turn_records"].append(
-                {
-                    "turn_id": turn_id,
-                    "kind": "tool_call" if is_tool_turn else "assistant_termination",
-                    "tool_names": tool_names,
-                    "tool_call_count": len(tool_names),
-                    "generated_token_count": generated_token_count,
-                    "actor_prompt_sha256": prompt_fingerprint,
-                    "tokenizer_contract_sha256": tokenizer_fingerprint,
-                    "generation_termination_reason": (
-                        harness_limit_reason
-                        or ("assistant_final" if natural_assistant_final else None)
-                    ),
-                    "credit_eligible": (
-                        (is_tool_turn and len(tool_names) == 1)
-                        or (natural_assistant_final and generated_token_count > 0)
-                    ),
-                }
-            )
+            turn_record = {
+                "turn_id": turn_id,
+                "kind": "tool_call" if is_tool_turn else "assistant_termination",
+                "tool_names": tool_names,
+                "tool_call_count": len(tool_names),
+                "generated_token_count": generated_token_count,
+                "actor_prompt_sha256": prompt_fingerprint,
+                "tokenizer_contract_sha256": tokenizer_fingerprint,
+                "generation_termination_reason": (
+                    harness_limit_reason or ("assistant_final" if natural_assistant_final else None)
+                ),
+                "credit_eligible": (
+                    (is_tool_turn and len(tool_names) == 1)
+                    or (natural_assistant_final and generated_token_count > 0)
+                ),
+            }
+            if prompt_token_candidate is not None:
+                # Runtime consumes this private candidate into the matching decision event.
+                # It is removed before turn spans are exported, so tokens are logged once.
+                turn_record["_actor_prompt_token_candidate"] = prompt_token_candidate
+            runtime_state["assistant_turn_records"].append(turn_record)
             runtime_state["current_assistant_turn_id"] = turn_id
             if not is_tool_turn:
                 if natural_assistant_final and generated_token_count > 0:
@@ -359,6 +516,12 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         )
         state = await session.start(task_id)
         state["environment_manifest_sha256"] = getattr(self, "environment_manifest_sha256", None)
+        capture_config = getattr(
+            self,
+            "actor_prompt_token_capture",
+            _DISABLED_ACTOR_PROMPT_TOKEN_CAPTURE,
+        )
+        state["_actor_prompt_token_capture_config"] = capture_config
         try:
             output = await super().run(sampling_params, **kwargs)
             if not state["done"] and not state["error"]:
@@ -378,6 +541,8 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
                 state["error"] = "trajectory_alignment_invalid:" + ",".join(
                     f"{key}={value}" for key, value in alignment_lengths.items()
                 )
+            for turn_record in state["assistant_turn_records"]:
+                turn_record.pop("_actor_prompt_token_candidate", None)
             try:
                 turn_spans = materialize_assistant_turn_spans(
                     state["assistant_turn_records"],
@@ -421,6 +586,13 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
                 "turn_span_valid": turn_span_valid,
                 "turn_span_error": turn_span_error,
                 "turn_spans": turn_spans,
+                "actor_prompt_token_capture": {
+                    "version": capture_config["version"],
+                    "enabled": bool(capture_config["enabled"]),
+                    "captured_events": int(state["actor_prompt_token_capture_count"]),
+                    "max_events_per_trajectory": int(capture_config["max_events_per_trajectory"]),
+                    "error": state["actor_prompt_token_capture_error"],
+                },
                 "reward_mode": self.reward_mode,
                 "policy_reward_version": breakdown["policy_reward_version"],
                 "valid_for_learning": bool(breakdown["valid_for_learning"]),

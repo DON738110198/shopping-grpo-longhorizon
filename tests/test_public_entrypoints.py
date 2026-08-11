@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from scripts.check_grpo_runtime import validate_agent_loop_config
 from scripts.train_grpo import build_command, parse_args
 from scripts.train_grpo import main as train_grpo_main
 from shopping_grpo.cli import main as cli_main
@@ -16,6 +19,15 @@ from shopping_grpo.smoke import run_cpu_smoke
 
 
 class PublicEntrypointTest(unittest.TestCase):
+    def test_public_grpo_launcher_defaults_to_non_capture_agent_loop(self):
+        root = Path(__file__).resolve().parents[1]
+        with patch.object(sys, "argv", ["train_grpo.py"]):
+            args = parse_args()
+        self.assertEqual(
+            args.agent_loop_config.resolve(),
+            (root / "configs/agent_loop.yaml").resolve(),
+        )
+
     def test_cpu_smoke_covers_public_contracts(self):
         result = run_cpu_smoke()
 
@@ -62,6 +74,11 @@ class PublicEntrypointTest(unittest.TestCase):
             train.write_bytes(b"example")
             validation = temporary / "validation.parquet"
             validation.write_bytes(b"example")
+            custom_config = temporary / "custom_grpo.yaml"
+            custom_config.write_text(
+                (root / "configs/grpo.yaml").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
             output = temporary / "output"
             with patch.object(
                 sys,
@@ -77,7 +94,9 @@ class PublicEntrypointTest(unittest.TestCase):
                     "--output",
                     str(output),
                     "--config",
-                    str(root / "configs/grpo.yaml"),
+                    str(custom_config),
+                    "--agent-loop-config",
+                    str(root / "configs/agent_loop_active_capture.yaml"),
                     "--logger",
                     "console",
                     "--dry-run",
@@ -90,6 +109,11 @@ class PublicEntrypointTest(unittest.TestCase):
         self.assertEqual(environment["GRPO_MODEL_PATH"], str(model))
         self.assertEqual(environment["GRPO_TRAIN_FILE"], str(train))
         self.assertEqual(environment["GRPO_VAL_FILE"], str(validation))
+        self.assertEqual(environment["GRPO_CONFIG_DIR"], str(temporary.resolve()))
+        self.assertEqual(
+            environment["SHOPPING_AGENT_LOOP_CONFIG"],
+            str((root / "configs/agent_loop_active_capture.yaml").resolve()),
+        )
         self.assertEqual(environment["VLLM_USE_FLASHINFER_SAMPLER"], "0")
         self.assertIn("trainer.logger=[console]", command)
         self.assertIn("data.seed=42", command)
@@ -120,6 +144,8 @@ class PublicEntrypointTest(unittest.TestCase):
                 str(output),
                 "--config",
                 str(root / "configs/grpo.yaml"),
+                "--agent-loop-config",
+                str(root / "configs/agent_loop_active_capture.yaml"),
                 "--logger",
                 "console",
                 "--experiment-name",
@@ -149,6 +175,61 @@ class PublicEntrypointTest(unittest.TestCase):
             self.assertIn("check_grpo_runtime.py", preflight[1])
             self.assertIn("verl.trainer.main_ppo", training)
             write_evidence.assert_called_once()
+            self.assertEqual(
+                write_evidence.call_args.kwargs["agent_config"],
+                (root / "configs/agent_loop_active_capture.yaml").resolve(),
+            )
+
+    @unittest.skipUnless(importlib.util.find_spec("omegaconf"), "requires OmegaConf")
+    def test_active_capture_profile_changes_only_the_bounded_capture_contract(self):
+        from omegaconf import OmegaConf
+
+        root = Path(__file__).resolve().parents[1]
+        base = OmegaConf.to_container(
+            OmegaConf.load(root / "configs/agent_loop.yaml"),
+            resolve=False,
+        )[0]
+        active = OmegaConf.to_container(
+            OmegaConf.load(root / "configs/agent_loop_active_capture.yaml"),
+            resolve=False,
+        )[0]
+        base_capture = base.pop("actor_prompt_token_capture")
+        active_capture = active.pop("actor_prompt_token_capture")
+
+        self.assertEqual(base, active)
+        self.assertFalse(base_capture["enabled"])
+        self.assertEqual(base_capture["max_events_per_trajectory"], 1)
+        self.assertTrue(active_capture["enabled"])
+        self.assertEqual(active_capture["max_events_per_trajectory"], 48)
+
+    @unittest.skipUnless(importlib.util.find_spec("omegaconf"), "requires OmegaConf")
+    def test_preflight_resolves_the_launcher_selected_agent_loop(self):
+        from omegaconf import OmegaConf
+
+        root = Path(__file__).resolve().parents[1]
+        selected = (root / "configs/agent_loop_active_capture.yaml").resolve()
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "rollout": {
+                        "agent": {"agent_loop_config_path": str(selected)}
+                    }
+                }
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"SHOPPING_AGENT_LOOP_CONFIG": str(selected)},
+            clear=False,
+        ), patch("builtins.print"):
+            validate_agent_loop_config(config, lambda raw: raw)
+
+        with patch.dict(
+            os.environ,
+            {"SHOPPING_AGENT_LOOP_CONFIG": str(root / "configs/agent_loop.yaml")},
+            clear=False,
+        ), self.assertRaisesRegex(SystemExit, "does not match launcher selection"):
+            validate_agent_loop_config(config, lambda raw: raw)
 
 
 if __name__ == "__main__":

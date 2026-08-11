@@ -9,7 +9,10 @@ from unittest.mock import patch
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 
-from shopping_grpo.training.grpo.adapter.agent_loop import ShoppingToolAgentLoop
+from shopping_grpo.training.grpo.adapter.agent_loop import (
+    ShoppingToolAgentLoop,
+    validate_actor_prompt_token_capture_config,
+)
 from shopping_grpo.training.grpo.adapter.runtime import (
     current_environment,
     current_runtime_state,
@@ -23,6 +26,12 @@ from shopping_grpo.training.grpo.adapter.runtime import (
 )
 from shopping_grpo.training.grpo.adapter.session import ShopSimulatorSession
 from shopping_grpo.training.grpo.adapter.tools import ShopSimulatorTool
+from shopping_grpo.training.grpo.pivotal_states import (
+    ACTOR_PROMPT_TOKENS_VERSION,
+    observation_sha256,
+    replay_state_id,
+    token_ids_sha256,
+)
 
 
 def make_tool(name):
@@ -104,6 +113,207 @@ def make_agent_data():
 
 
 class VerlAdapterRuntimeTest(unittest.TestCase):
+    def test_actor_prompt_token_capture_config_is_bounded_and_fail_closed(self):
+        config = validate_actor_prompt_token_capture_config(
+            {
+                "enabled": True,
+                "task_ids": [7, 7, 3],
+                "decision_indices": [2, 0],
+                "replay_state_ids": ["a" * 64],
+                "max_events_per_trajectory": 2,
+            }
+        )
+        self.assertEqual(config["version"], ACTOR_PROMPT_TOKENS_VERSION)
+        self.assertEqual(config["task_ids"], (3, 7))
+        self.assertEqual(config["decision_indices"], (0, 2))
+        self.assertEqual(config["replay_state_ids"], ("a" * 64,))
+
+        with self.assertRaisesRegex(ValueError, "unknown actor_prompt_token_capture"):
+            validate_actor_prompt_token_capture_config({"enabled": True, "typo": 1})
+        with self.assertRaisesRegex(ValueError, "must be in"):
+            validate_actor_prompt_token_capture_config(
+                {"enabled": True, "max_events_per_trajectory": 0}
+            )
+        with self.assertRaisesRegex(ValueError, "lowercase sha256"):
+            validate_actor_prompt_token_capture_config(
+                {"enabled": True, "replay_state_ids": ["not-a-state"]}
+            )
+        for falsey_non_mapping in ([], "", 0, False):
+            with (
+                self.subTest(falsey_non_mapping=falsey_non_mapping),
+                self.assertRaisesRegex(
+                    TypeError,
+                    "must be an object",
+                ),
+            ):
+                validate_actor_prompt_token_capture_config(falsey_non_mapping)
+        with self.assertRaisesRegex(TypeError, "task_ids must be a list"):
+            validate_actor_prompt_token_capture_config({"task_ids": {7: True}})
+        with self.assertRaisesRegex(TypeError, "replay_state_ids must be a list"):
+            validate_actor_prompt_token_capture_config({"replay_state_ids": {"a" * 64: True}})
+
+    def test_actor_prompt_tokens_capture_exact_post_compaction_prompt_once(self):
+        async def fake_parent_generate(
+            _loop,
+            agent_data,
+            sampling_params,
+            ignore_termination=False,
+        ):
+            del sampling_params, ignore_termination
+            self.assertEqual(agent_data.prompt_ids, [101, 12, 22])
+            agent_data.prompt_ids.append(99)
+            agent_data.response_mask.append(1)
+            agent_data.tool_calls = [SimpleNamespace(name="open_product")]
+            return AgentState.PROCESSING_TOOLS
+
+        async def run():
+            state_id = replay_state_id(
+                7,
+                [],
+                observation_sha256("raw public page"),
+                observation_kind="raw_public_observation",
+                environment_manifest_sha256="a" * 64,
+                public_query_sha256="b" * 64,
+            )
+            loop = make_generation_loop(response_length=64, max_assistant_turns=40)
+            loop.context_compaction_enable = True
+            loop.context_input_budget = 3
+            loop.actor_prompt_token_capture = validate_actor_prompt_token_capture_config(
+                {
+                    "enabled": True,
+                    "task_ids": [7],
+                    "decision_indices": [0],
+                    "replay_state_ids": [state_id],
+                    "max_events_per_trajectory": 1,
+                }
+            )
+            agent_data = make_agent_data()
+            agent_data.prompt_ids = [101, 11, 21, 12, 22]
+            agent_data.response_mask = [1, 0, 1, 0]
+            agent_data.response_logprobs = []
+            state = make_runtime_state(task_id=7, max_steps=35)
+            state["environment_manifest_sha256"] = "a" * 64
+            state["public_query_sha256"] = "b" * 64
+            state["latest_observation"] = "projected public page"
+            state["latest_observation_raw"] = "raw public page"
+            state["replay_observation_v2_complete"] = True
+            state["assistant_turn_records"] = [
+                {"turn_id": 0, "kind": "tool_call"},
+                {"turn_id": 1, "kind": "tool_call"},
+            ]
+            state["next_assistant_turn_id"] = 2
+            token = current_runtime_state.set(state)
+            try:
+                with patch.object(
+                    ToolAgentLoop,
+                    "_handle_generating_state",
+                    fake_parent_generate,
+                ):
+                    next_state = await loop._handle_generating_state(agent_data, {})
+                event = record_action_attempt(
+                    state,
+                    "open_product",
+                    {"asin": "123"},
+                    state["latest_observation"],
+                )
+            finally:
+                current_runtime_state.reset(token)
+            return next_state, state, event
+
+        next_state, state, event = asyncio.run(run())
+        self.assertEqual(next_state, AgentState.PROCESSING_TOOLS)
+        materialized = event["actor_prompt_tokens"]
+        self.assertEqual(
+            set(materialized),
+            {"version", "sha256", "count", "tokens"},
+        )
+        self.assertEqual(materialized["version"], ACTOR_PROMPT_TOKENS_VERSION)
+        self.assertEqual(materialized["tokens"], [101, 12, 22])
+        self.assertEqual(materialized["count"], 3)
+        self.assertEqual(materialized["sha256"], token_ids_sha256([101, 12, 22]))
+        self.assertEqual(materialized["sha256"], event["actor_prompt_sha256"])
+        self.assertEqual(state["actor_prompt_token_capture_count"], 1)
+        self.assertEqual(state["context_tokens_removed"], 2)
+        self.assertNotIn(
+            "_actor_prompt_token_candidate",
+            state["assistant_turn_records"][-1],
+        )
+
+    def test_actor_prompt_token_capture_respects_event_limit_and_is_default_off(self):
+        async def fake_parent_generate(
+            _loop,
+            agent_data,
+            sampling_params,
+            ignore_termination=False,
+        ):
+            del sampling_params, ignore_termination
+            agent_data.prompt_ids.append(99)
+            agent_data.response_mask.append(1)
+            agent_data.tool_calls = [SimpleNamespace(name="open_product")]
+            return AgentState.PROCESSING_TOOLS
+
+        async def run(config, captured_events):
+            loop = make_generation_loop(response_length=64, max_assistant_turns=40)
+            loop.actor_prompt_token_capture = config
+            agent_data = make_agent_data()
+            state = make_runtime_state(task_id=7, max_steps=35)
+            state["actor_prompt_token_capture_count"] = captured_events
+            token = current_runtime_state.set(state)
+            try:
+                with patch.object(
+                    ToolAgentLoop,
+                    "_handle_generating_state",
+                    fake_parent_generate,
+                ):
+                    await loop._handle_generating_state(agent_data, {})
+                return record_action_attempt(state, "open_product", {"asin": "123"}, "page")
+            finally:
+                current_runtime_state.reset(token)
+
+        disabled = validate_actor_prompt_token_capture_config()
+        at_limit = validate_actor_prompt_token_capture_config(
+            {"enabled": True, "max_events_per_trajectory": 1}
+        )
+        wrong_task = validate_actor_prompt_token_capture_config(
+            {"enabled": True, "task_ids": [8], "max_events_per_trajectory": 1}
+        )
+        wrong_decision = validate_actor_prompt_token_capture_config(
+            {"enabled": True, "decision_indices": [1], "max_events_per_trajectory": 1}
+        )
+        wrong_state = validate_actor_prompt_token_capture_config(
+            {"enabled": True, "replay_state_ids": ["f" * 64], "max_events_per_trajectory": 1}
+        )
+        self.assertNotIn("actor_prompt_tokens", asyncio.run(run(disabled, 0)))
+        self.assertNotIn("actor_prompt_tokens", asyncio.run(run(at_limit, 1)))
+        self.assertNotIn("actor_prompt_tokens", asyncio.run(run(wrong_task, 0)))
+        self.assertNotIn("actor_prompt_tokens", asyncio.run(run(wrong_decision, 0)))
+        self.assertNotIn("actor_prompt_tokens", asyncio.run(run(wrong_state, 0)))
+
+    def test_actor_prompt_token_capture_failure_marks_trajectory_invalid_before_generation(self):
+        async def run():
+            loop = make_generation_loop(response_length=64, max_assistant_turns=40)
+            loop.actor_prompt_token_capture = validate_actor_prompt_token_capture_config(
+                {"enabled": True, "max_events_per_trajectory": 1}
+            )
+            agent_data = make_agent_data()
+            # The ordinary hash normalizes this value, while exact capture rejects it.
+            agent_data.prompt_ids = ["101"]
+            state = make_runtime_state(task_id=7, max_steps=35)
+            token = current_runtime_state.set(state)
+            try:
+                next_state = await loop._handle_generating_state(agent_data, {})
+            finally:
+                current_runtime_state.reset(token)
+            return next_state, state
+
+        next_state, state = asyncio.run(run())
+        self.assertEqual(next_state, AgentState.TERMINATED)
+        self.assertTrue(state["infrastructure_invalid"])
+        self.assertTrue(state["terminate"])
+        self.assertEqual(state["termination_reason"], "actor_prompt_token_capture_failed")
+        self.assertIn("must be integers", state["actor_prompt_token_capture_error"])
+        self.assertEqual(state["assistant_turn_records"], [])
+
     def test_response_length_limit_is_not_recorded_as_assistant_final(self):
         async def run():
             loop = make_generation_loop(response_length=3, max_assistant_turns=40)

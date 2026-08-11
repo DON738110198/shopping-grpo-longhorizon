@@ -1,22 +1,18 @@
 - name: shopping_tool_agent
-  # veRL 根据 _target_ 动态实例化项目适配器。父类负责生成状态机，子类只接管
-  # ShopSimulator session、observation 投影、上下文护栏与 Reward v3 结算。
+  # This bounded diagnostic profile differs from agent_loop.yaml only by
+  # capturing every actor-visible decision prompt needed by an active probe.
   _target_: shopping_grpo.training.grpo.adapter.agent_loop.ShoppingToolAgentLoop
   base_url: ${oc.env:SHOPSIM_BASE_URL,http://127.0.0.1:5700}
   timeout: 60
   max_steps: 35
   required_environment_version: shopsimulator-environment-v2.1
-  # Exact actor-visible prompt ids are intentionally absent from ordinary rollout logs.
-  # Enable only for bounded active-branch probes, optionally narrowed to task/decision/state.
   actor_prompt_token_capture:
     version: shopping-actor-prompt-tokens-v1
-    enabled: false
+    enabled: true
     task_ids: []
     decision_indices: []
     replay_state_ids: []
-    max_events_per_trajectory: 1
-  # Reward v3 保持原样作为环境事实；policy_v1 只在训练侧给非法动作、重复动作和
-  # 可归因于模型的非正常终止提供有界学习信号。
+    max_events_per_trajectory: 48
   reward_mode: policy_v1
   policy_reward:
     version: shopping-policy-reward-v1
@@ -32,15 +28,12 @@
       context_hard_limit_exceeded: -0.55
       parallel_tool_calls: -0.60
       too_many_guard_rejections: -0.70
-  # 模型窗口 24576 = 最多 16384 输入预算 + 512 本轮生成保留 + 512 安全余量，
-  # 剩余空间用于当前 trajectory 增长；默认不主动压缩历史，超限即标无效。
   context_window_tokens: 24576
   context_generation_reserve_tokens: 512
   context_safety_margin_tokens: 512
   context_input_budget_tokens: 16384
   context_preserve_recent_groups: 1
   context_compaction_enable: false
-  # 搜索页、商品详情页、通用页面采用不同投影预算；投影必须保留当前可执行动作 footer。
   observation_token_budget: 1536
   observation_detail_token_budget: 4096
   observation_generic_token_budget: 768

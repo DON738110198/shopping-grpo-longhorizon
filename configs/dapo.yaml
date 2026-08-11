@@ -100,7 +100,9 @@ actor_rollout_ref:
       # worker 是并发执行 AgentLoop 的协程/进程容量，不等于 rollout.n。
       num_workers: 8
       default_agent_loop: shopping_tool_agent
-      agent_loop_config_path: ${oc.env:SHOPPING_GRPO_ROOT}/configs/agent_loop.yaml
+      # The launcher resolves and hashes this exact file. Ordinary runs use the
+      # default config; bounded active-branch probes opt into a capture config.
+      agent_loop_config_path: ${oc.env:SHOPPING_AGENT_LOOP_CONFIG}
     multi_turn:
       # 每轮只允许一个 tool call；模型输出 -> 工具 -> observation 会重复多轮。
       # 40 是框架护栏，业务环境仍由 max_steps=35 更早终止。

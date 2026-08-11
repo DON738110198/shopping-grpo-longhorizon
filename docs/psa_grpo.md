@@ -1,7 +1,8 @@
 # PSA-GRPO 离线可行性审计
 
-> 状态：方法原型与离线审计已实现，尚未进行 PSA-GRPO 训练。`PSA-GRPO`
-> 是当前项目内的工作名（Pivotal-State Action Credit GRPO），不宣称学术首创。
+> 状态：方法原型、固定策略状态审计与主动 suffix 执行器已经实现；尚未进行
+> PSA-GRPO 参数更新。`PSA-GRPO` 是当前项目内的工作名（Pivotal-State Action
+> Credit GRPO），不宣称学术首创。
 
 ## 问题
 
@@ -57,16 +58,38 @@ Observation:    [assistant_end, next_assistant_start)
 `think` 和未完成环境就输出最终回答也会进入 `decision_trace`，但不会进入环境 replay
 ledger。
 
-### 3. 逐步公开回放
+### 3. Outcome-blind 选择与逐步公开回放
+
+`select_pivotal_states.py` 直接扫描未截断的 `sampling_audit.jsonl`，不读取
+`strict`、`terminal_utility` 或 `policy_reward`。它用固定 seed 对 task 和裸
+`branch_uid` 做哈希排序，跨 global step 去重，先为每题选一个 state、再选第二个，
+每题最多两个。选择结果绑定 input SHA256，并保留 line、trajectory index 与 event
+index；这里的 pivotal 标签可以使用 Actor 已采样的当前动作，但绝不使用终局结果。
+
+```bash
+.venv/bin/python scripts/select_pivotal_states.py \
+  --input "$RUN/sampling_audit.jsonl" \
+  --output "$RUN/pivotal_selection.json" \
+  --seed 20260811 \
+  --max-states 50
+
+.venv/bin/python scripts/verify_pivotal_replay.py \
+  --selection "$RUN/pivotal_selection.json" \
+  --input "$RUN/sampling_audit.jsonl" \
+  --environment-manifest data/environment.json \
+  --output "$RUN/pivotal_live_replay.json"
+```
 
 `verify_pivotal_replay.py` 会在固定 Environment manifest 下执行：
 
-1. `reset(task_id)`，要求 Observation v2；
-2. 逐个执行 exact accepted action；
-3. 每一步比较 before/after public observation SHA256；
-4. 同时核对本地 manifest 和服务端 reset 返回的 manifest digest；
-5. 在正常、环境异常和响应序列化异常路径释放环境租约；
-6. 结果只写 hash、计数和异常类型，不保存服务端 raw payload。
+1. 在创建任何环境前，完整核对 selection schema、input hash 与每个精确 locator；
+2. `reset(task_id)`，要求 Observation v2；
+3. 逐个执行 exact accepted action；
+4. 每一步比较 before/after public observation SHA256；
+5. 同时核对本地 manifest 和服务端 reset 返回的 manifest digest；
+6. 在正常、环境异常和响应序列化异常路径释放环境租约；
+7. 强制 `N selected -> N resolved -> N results`，任一 replay/release 失败都返回非零；
+8. 结果只写 hash、计数和异常类型，不保存服务端 raw payload。
 
 隐藏 goal、目标 ASIN、正确规格和 Reward 细节不参与 state/branch identity，也不会写入
 分叉审计。
@@ -109,24 +132,110 @@ Observation v2 完整性和 replay ledger 字段，因此下表只能统计观�
 outputs/experiments/psa_grpo_offline_20260811/
 ```
 
+## 固定策略可行性结果
+
+2026-08-11 在固定 SFT actor 上完成了 `lr=0`、25-step 的状态覆盖采集。该运行只验证
+producer、动态采样和 replay 合同，不是性能实验：
+
+| 指标 | 结果 |
+| --- | ---: |
+| generated / optimizer groups | 84 / 50 |
+| optimizer group 利用率 | 59.52% |
+| infrastructure-invalid groups | 1 / 84 (1.19%) |
+| exact-contract pivotal states | 2,854 |
+| unique tasks | 84 |
+| task-cap@2 states | 168 |
+
+唯一基础设施无效组来自 task 17349 的 `reward_unverifiable`。对 87 个 smoke 前缀执行
+live reset + replay 时，87/87 的公开状态 hash 一致，且所有环境租约均释放。完整
+25-step 审计未启用 actor prompt token capture，因此只证明“可找到并回放状态”，不能
+直接用于主动分叉或训练；主动 suffix 必须从启用
+`configs/agent_loop_active_capture.yaml` 的新采集生成。
+
 ## 启动门槛
 
 历史日志的 `exact-contract states = 0` 表示“旧 producer 没记录新合同”，不是证明
 中间状态不存在。下一步先用固定 SFT policy 采集新审计轨迹，不更新权重：
 
-1. 运行 1 update 工程 smoke，确认 optimizer 流程、turn span、decision trace、server
-   manifest attestation 和 replay ledger 完整，且原 Reward/动态采样行为没有回归；
-2. 使用 `lr=0` 的固定 SFT policy 收集 25 steps，避免把不同 policy 的状态混为一组；
-3. 要求至少 50 个 exact-contract pivotal states，覆盖至少 40 个 task，每题最多计 2
-   个 state；
-4. 对候选执行 live reset + replay，逐步 public hash 匹配率必须为 100%；
-5. 通过后才实现主动 suffix branching，每个状态采 `K>=4`，要求有效 mixed group 比例
+1. 已完成 1-update 工程 smoke 与 `lr=0` 的 25-step 固定策略状态采集；
+2. 下一次 1-update 采集显式启用 actor prompt token capture，要求候选事件的 token、
+   prompt hash、turn span 和 branch identity 全部一致；
+3. 从该新产物按 outcome-blind 规则选择两个 state，并逐个执行 live reset + replay，
+   public hash 匹配率必须为 100%；
+4. 通过后运行 `2 states x 4 suffixes` 机械 smoke，要求 8/8 结果齐全、prompt echo 精确、
+   tensor 对齐且所有环境租约释放；
+5. 后续扩大主动 suffix branching 时，每个状态采 `K>=4`，要求有效 mixed group 比例
    `>=40%`、真实基础设施无效率 `<=5%`；
 6. 只有主动分叉产生的 suffix tensor 可以训练。历史 sampling-audit JSON 永远不能直接
    当作训练数据。
 
-正式主动分叉还必须把 policy scope 绑定到 actor checkpoint/weight digest 与 decoding
-config；当前 `run_manifest + global_step` 只适用于同一同步采样 run，不能跨 resume 或
-异步 stale actor 合组。
+主动分叉 runner 已把 policy scope 绑定到 actor checkpoint、live vLLM 元数据和完整
+decoding config；尚未在远端真实 vLLM/Environment 上完成协议 smoke，所以仍不能把
+本地 fake 测试当成可训练性证据。
+
+### 2 x 4 机械采集命令
+
+先启动加载 `$ACTOR` 的独立 vLLM。该进程必须显式带
+`--generation-config vllm`，并把完整启动命令保存到 `$RUN/server_launch_command.txt`；
+OpenAI API 不能证明这个启动参数，因此 summary 会保留
+`generation_config_api_attested=false`。随后从 live `/version`、`/v1/models` 和实际 actor 目录
+物化合同。materializer 默认读取
+`configs/active_suffix_decoding_template.json`，不接受手填 backend digest：
+
+```bash
+.venv/bin/python scripts/select_pivotal_states.py \
+  --input "$RUN/sampling_audit.jsonl" \
+  --output "$RUN/pivotal_selection_2.json" \
+  --seed 20260811 \
+  --max-states 2 \
+  --require-prompt-capture
+
+.venv/bin/python scripts/materialize_active_suffix_contract.py \
+  --actor-checkpoint "$ACTOR" \
+  --served-model "$SERVED_MODEL" \
+  --vllm-base-url http://127.0.0.1:8000/v1 \
+  --backend-output "$RUN/sampling_backend_contract.json" \
+  --decoding-output "$RUN/active_suffix_decoding.json"
+
+.venv/bin/python scripts/build_active_branch_plan.py \
+  --selection "$RUN/pivotal_selection_2.json" \
+  --input "$RUN/sampling_audit.jsonl" \
+  --decoding-config "$RUN/active_suffix_decoding.json" \
+  --actor-checkpoint "$ACTOR" \
+  --seed 20260811 \
+  --suffixes-per-state 4 \
+  --output "$RUN/active_branch_plan.json"
+
+.venv/bin/python scripts/collect_active_suffixes.py \
+  --plan "$RUN/active_branch_plan.json" \
+  --selection "$RUN/pivotal_selection_2.json" \
+  --input "$RUN/sampling_audit.jsonl" \
+  --actor-checkpoint "$ACTOR" \
+  --sampling-backend-contract "$RUN/sampling_backend_contract.json" \
+  --served-model "$SERVED_MODEL" \
+  --vllm-base-url http://127.0.0.1:8000/v1 \
+  --environment-base-url http://127.0.0.1:5700 \
+  --vllm-timeout 180 \
+  --environment-timeout 60 \
+  --expected-states 2 \
+  --suffixes-per-state 4 \
+  --output "$RUN/active_suffixes.jsonl" \
+  --summary-output "$RUN/active_suffix_summary.json"
+```
+
+这一步只有 `8` 条 suffix rollout，不创建 optimizer，也不更新权重。每个 suffix 使用独立
+environment lease；runner 恢复完整 prefix counter，并按 veRL 0.8 的剩余上下文公式动态计算
+每轮 `max_tokens`。首轮使用 plan suffix seed，后续轮使用绑定到 suffix/turn 的 SHA256 seed。
+任何 actor、prompt、replay hash、backend、token echo、tensor alignment 或 `K` 合同不一致都会
+写入有界错误码；只要存在 infrastructure-invalid suffix，CLI 会在写完 artifact 后非零退出。
+
+该逐轮 seed 方案是主动分叉实验的受控采样策略，不宣称复现 veRL 异步 worker 的随机数消费
+顺序。vLLM 必须以 `--generation-config vllm` 启动并保存 PID、完整命令和日志；`/version`
+与 `/v1/models` 只能证明 live 服务版本、模型别名和模型根目录，不能单独证明
+generation-config。
+
+当前 plan v1 是 `training_ready=false` 的机械 smoke：collection provenance 会显式记录环境
+version、manifest SHA 集合和 policy-reward config SHA，但这些字段尚未进入 group UID。进入训练
+前必须升级 plan v2，把 environment version 和 policy-reward SHA 纳入 plan/group identity。
 
 在这些门槛通过前，报告中的 `training_ready` 固定为 `false`，也不运行 Final-200。

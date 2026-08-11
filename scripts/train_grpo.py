@@ -61,6 +61,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-name", default="shopping-agent-grpo")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--agent-loop-config",
+        type=Path,
+        default=DEFAULT_AGENT_CONFIG,
+        help=(
+            "veRL AgentLoop YAML to resolve, preflight, and record in the run "
+            "manifest"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "hydra_overrides",
@@ -135,6 +144,7 @@ def _write_run_evidence(
     train_data: Path,
     val_data: Path,
     config: Path,
+    agent_config: Path,
 ) -> None:
     resolved = subprocess.run(
         [*command, "--cfg", "job", "--resolve"],
@@ -183,7 +193,7 @@ def _write_run_evidence(
             "validation": _file_evidence(val_data),
         },
         "config": _file_evidence(config),
-        "agent_loop_config": _file_evidence(DEFAULT_AGENT_CONFIG),
+        "agent_loop_config": _file_evidence(agent_config),
         "tool_config": _file_evidence(DEFAULT_TOOL_CONFIG),
         "packages": {
             name: importlib.metadata.version(name)
@@ -213,6 +223,9 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     train_data = _validated_path(args.train_data, "train parquet")
     val_data = _validated_path(args.val_data, "validation parquet")
     config = _validated_path(args.config, "GRPO example config")
+    agent_config = _validated_path(args.agent_loop_config, "AgentLoop config")
+    if not agent_config.is_file():
+        raise SystemExit(f"AgentLoop config must be a file: {agent_config}")
     output = args.output.expanduser().resolve()
     if output.exists():
         if not output.is_dir():
@@ -236,8 +249,9 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
             "GRPO_VAL_FILE": str(val_data),
             "GRPO_OUTPUT_DIR": str(output),
             "SHOPSIM_BASE_URL": str(args.env_url),
-            "SHOPPING_AGENT_LOOP_CONFIG": str(DEFAULT_AGENT_CONFIG),
+            "SHOPPING_AGENT_LOOP_CONFIG": str(agent_config),
             "SHOPPING_TOOL_CONFIG": str(DEFAULT_TOOL_CONFIG),
+            "GRPO_CONFIG_DIR": str(config.parent),
             "GRPO_CONFIG_NAME": config.stem,
             # This FlashInfer build rejects Blackwell SM 12.x during sampler warmup.
             # PyTorch sampling remains deterministic under the configured vLLM seed.
@@ -278,6 +292,7 @@ def main() -> None:
         "output": environment["GRPO_OUTPUT_DIR"],
         "logger": args.logger,
         "config": str(args.config.resolve()),
+        "agent_loop_config": environment["SHOPPING_AGENT_LOOP_CONFIG"],
         "seed": args.seed,
     }
     print(json.dumps(audit, ensure_ascii=False, indent=2))
@@ -303,6 +318,7 @@ def main() -> None:
         train_data=Path(environment["GRPO_TRAIN_FILE"]),
         val_data=Path(environment["GRPO_VAL_FILE"]),
         config=args.config.expanduser().resolve(),
+        agent_config=Path(environment["SHOPPING_AGENT_LOOP_CONFIG"]),
     )
     raise SystemExit(subprocess.call(command, cwd=ROOT, env=environment))
 

@@ -133,10 +133,70 @@ def compose_runtime_config(overrides):
         raise SystemExit(f"cannot parse GRPO config before preflight: {exc}") from exc
 
     GlobalHydra.instance().clear()
-    config_dir = Path(__file__).resolve().parents[1] / "configs"
+    raw_config_dir = os.environ.get("GRPO_CONFIG_DIR")
+    if not raw_config_dir:
+        raise SystemExit("GRPO_CONFIG_DIR is required")
+    config_dir = Path(raw_config_dir).expanduser().resolve()
+    if not config_dir.is_dir():
+        raise SystemExit(f"GRPO_CONFIG_DIR does not exist: {config_dir}")
     config_name = os.environ.get("GRPO_CONFIG_NAME", "grpo")
     with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
         return compose(config_name=config_name, overrides=list(overrides))
+
+
+def validate_agent_loop_config(config, capture_validator):
+    """Resolve the exact AgentLoop YAML selected by the public launcher."""
+    config_path = os.environ.get("SHOPPING_AGENT_LOOP_CONFIG")
+    if not config_path:
+        raise SystemExit("SHOPPING_AGENT_LOOP_CONFIG is required")
+    selected_path = Path(config_path).expanduser().resolve()
+    if not selected_path.is_file():
+        raise SystemExit(f"AgentLoop config does not exist: {selected_path}")
+
+    configured_path = Path(
+        str(config.actor_rollout_ref.rollout.agent.agent_loop_config_path)
+    ).expanduser().resolve()
+    if configured_path != selected_path:
+        raise SystemExit(
+            "resolved AgentLoop config path does not match launcher selection: "
+            f"resolved={configured_path}, selected={selected_path}"
+        )
+
+    try:
+        from omegaconf import OmegaConf
+
+        payload = OmegaConf.to_container(
+            OmegaConf.load(selected_path),
+            resolve=True,
+        )
+    except Exception as exc:
+        raise SystemExit(f"cannot resolve AgentLoop config {selected_path}: {exc}") from exc
+    if not isinstance(payload, list) or len(payload) != 1:
+        raise SystemExit("AgentLoop config must contain exactly one loop definition")
+    loop = payload[0]
+    if not isinstance(loop, dict):
+        raise SystemExit("AgentLoop definition must be an object")
+    if loop.get("name") != "shopping_tool_agent":
+        raise SystemExit("AgentLoop config must define shopping_tool_agent")
+    if loop.get("_target_") != (
+        "shopping_grpo.training.grpo.adapter.agent_loop.ShoppingToolAgentLoop"
+    ):
+        raise SystemExit("AgentLoop config selects an unsupported implementation")
+    try:
+        capture = capture_validator(loop.get("actor_prompt_token_capture"))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"invalid actor prompt capture config: {exc}") from exc
+    print(
+        "AgentLoop config preflight passed: "
+        + json.dumps(
+            {
+                "path": str(selected_path),
+                "prompt_capture_enabled": bool(capture["enabled"]),
+                "prompt_capture_limit": int(capture["max_events_per_trajectory"]),
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def validate_transformers_revision():
@@ -397,7 +457,10 @@ def main():
         from verl.tools.base_tool import BaseTool
         from verl.utils.tracking import Tracking
 
-        from shopping_grpo.training.grpo.adapter.agent_loop import ShoppingToolAgentLoop
+        from shopping_grpo.training.grpo.adapter.agent_loop import (
+            ShoppingToolAgentLoop,
+            validate_actor_prompt_token_capture_config,
+        )
         from shopping_grpo.training.grpo.adapter.tools import ShopSimulatorTool
         from shopping_grpo.training.grpo.compat import install_torch_padding_fallback
     except ImportError as exc:
@@ -420,6 +483,10 @@ def main():
         raise SystemExit("veRL 0.8 built-in qwen3_coder parser is unavailable")
     if "swanlab" not in Tracking.supported_backend:
         raise SystemExit("veRL 0.8 SwanLab tracking backend is unavailable")
+    validate_agent_loop_config(
+        config,
+        validate_actor_prompt_token_capture_config,
+    )
     validate_dynamic_sampling(config, verl_source, installed)
     validate_swanlab_tracking(config)
     install_torch_padding_fallback()

@@ -1,117 +1,104 @@
 #!/usr/bin/env python3
-"""Live-verify public pivotal prefixes against the frozen ShopSimulator."""
+"""Live-verify an exact, outcome-blind pivotal-state selection."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from shopping_grpo.environment.client import ShopAgentEnv
-from shopping_grpo.environment.manifest import sha256_file, validate_manifest
-from shopping_grpo.training.grpo.pivotal_states import (
-    validate_event_training_contract,
-)
+from shopping_grpo.environment.manifest import validate_manifest
 from shopping_grpo.training.grpo.replay import verify_replay_with_factory
+from shopping_grpo.training.grpo.selection import resolve_pivotal_selection
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--selection", type=Path, required=True)
+    parser.add_argument("--input", type=Path, action="append", required=True)
     parser.add_argument("--environment-manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:5700")
     parser.add_argument("--timeout", type=int, default=60)
-    parser.add_argument("--max-branches", type=int, default=100)
     return parser.parse_args()
 
 
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _load_validated_manifest(path: Path) -> dict[str, object]:
+def _load_validated_manifest_snapshot(path: Path) -> tuple[dict[str, object], str]:
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-        return validate_manifest(manifest)
-    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        payload = path.read_bytes()
+        manifest = json.loads(payload.decode("utf-8"))
+        validated = validate_manifest(manifest)
+        return validated, hashlib.sha256(payload).hexdigest()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid environment manifest: {exc}") from exc
 
 
-def _candidates(path: Path):
-    seen = set()
-    with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            for trajectory_index, trajectory in enumerate(record.get("trajectories", [])):
-                events = trajectory.get("decision_trace", trajectory.get("action_trace", []))
-                for event_index, event in enumerate(events):
-                    valid, reason = validate_event_training_contract(trajectory, event)
-                    if not valid:
-                        continue
-                    key = (
-                        str(event["branch_uid"]),
-                        int(event["prefix_action_count"]),
-                    )
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    yield {
-                        "trajectory": trajectory,
-                        "event": event,
-                        "source": {
-                            "line": line_number,
-                            "trajectory_index": trajectory_index,
-                            "event_index": event_index,
-                            "contract_reason": reason,
-                        },
-                    }
+def _load_validated_manifest(path: Path) -> dict[str, object]:
+    return _load_validated_manifest_snapshot(path)[0]
 
 
-def main():
-    args = parse_args()
-    input_path = args.input.expanduser().resolve()
-    manifest_path = args.environment_manifest.expanduser().resolve()
-    if not input_path.is_file():
-        raise SystemExit(f"sampling audit does not exist: {input_path}")
-    if not manifest_path.is_file():
-        raise SystemExit(f"environment manifest does not exist: {manifest_path}")
-    if args.max_branches < 1:
-        raise SystemExit("--max-branches must be positive")
+def _load_selection(path: Path) -> tuple[Mapping[str, object], str]:
     try:
-        manifest = _load_validated_manifest(manifest_path)
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-    manifest_hash = sha256_file(manifest_path)
-    required_environment_version = str(
-        manifest.get("environment_version", "shopsimulator-environment-v2.1")
+        payload = path.read_bytes()
+        selection = json.loads(payload.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid pivotal selection: {exc}") from exc
+    if not isinstance(selection, Mapping):
+        raise TypeError("invalid pivotal selection: root must be an object")
+    return selection, hashlib.sha256(payload).hexdigest()
+
+
+def _load_records(paths: Sequence[Path]):
+    provenance = []
+    records = []
+    for input_index, path in enumerate(paths):
+        payload = path.read_bytes()
+        provenance.append(
+            {
+                "path": str(path),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        for line_number, line in enumerate(payload.decode("utf-8").splitlines(), 1):
+            if line.strip():
+                records.append((input_index, str(path), line_number, json.loads(line)))
+    return provenance, records
+
+
+def verify_selected_replays(
+    selection: Mapping[str, object],
+    records: Iterable[tuple[int, str, int, Mapping[str, object]]],
+    *,
+    expected_inputs: Sequence[Mapping[str, object]],
+    environment_manifest_sha256: str,
+    required_environment_version: str,
+    required_max_steps: int,
+    env_factory,
+) -> list[dict[str, object]]:
+    """Preflight all locators, then replay every selected branch exactly once."""
+    candidates = resolve_pivotal_selection(
+        selection,
+        records,
+        expected_inputs=expected_inputs,
     )
-    required_max_steps = int(manifest["max_steps"])
     results = []
-    for candidate in _candidates(input_path):
-        if len(results) >= args.max_branches:
-            break
+    for candidate in candidates:
+        selected = candidate["selection"]
         trajectory = candidate["trajectory"]
-        event = candidate["event"]
+        if not isinstance(selected, Mapping) or not isinstance(trajectory, Mapping):
+            raise TypeError("resolved selection contract is invalid")
         verification = verify_replay_with_factory(
             trajectory,
-            environment_manifest_sha256=manifest_hash,
+            environment_manifest_sha256=environment_manifest_sha256,
             required_environment_version=required_environment_version,
             required_max_steps=required_max_steps,
-            env_factory=lambda: ShopAgentEnv(
-                base_url=args.base_url,
-                timeout=args.timeout,
-            ),
-            prefix_action_count=int(event["prefix_action_count"]),
+            env_factory=env_factory,
+            prefix_action_count=int(selected["prefix_action_count"]),
         )
-        expected_state_id = str(event["replay_state_id"])
+        expected_state_id = str(selected["replay_state_id"])
         if (
             verification.get("verified")
             and verification.get("recomputed_replay_state_id") != expected_state_id
@@ -125,20 +112,68 @@ def main():
             )
         results.append(
             {
-                "task_id": int(trajectory["task_id"]),
-                "branch_uid": str(event["branch_uid"]),
+                "selection_index": int(selected["selection_index"]),
+                "task_id": int(selected["task_id"]),
+                "branch_uid": str(selected["branch_uid"]),
                 "expected_replay_state_id": expected_state_id,
-                "prefix_action_count": int(event["prefix_action_count"]),
-                "source": candidate["source"],
+                "prefix_action_count": int(selected["prefix_action_count"]),
+                "pivotal_labels": list(selected["pivotal_labels"]),
+                "source": dict(selected["source"]),
                 "verification": verification,
             }
         )
-    verified = sum(bool(result["verification"]["verified"]) for result in results)
+    if len(results) != len(candidates):  # pragma: no cover - loop is exhaustive.
+        raise AssertionError("live verifier lost selected branches")
+    return results
+
+
+def main():
+    args = parse_args()
+    selection_path = args.selection.expanduser().resolve()
+    input_paths = [path.expanduser().resolve() for path in args.input]
+    manifest_path = args.environment_manifest.expanduser().resolve()
+    if not selection_path.is_file():
+        raise SystemExit(f"pivotal selection does not exist: {selection_path}")
+    for path in input_paths:
+        if not path.is_file():
+            raise SystemExit(f"sampling audit does not exist: {path}")
+    if not manifest_path.is_file():
+        raise SystemExit(f"environment manifest does not exist: {manifest_path}")
+    try:
+        selection, selection_hash = _load_selection(selection_path)
+        manifest, manifest_hash = _load_validated_manifest_snapshot(manifest_path)
+        input_provenance, records = _load_records(input_paths)
+        required_environment_version = str(
+            manifest.get("environment_version", "shopsimulator-environment-v2.1")
+        )
+        required_max_steps = int(manifest["max_steps"])
+        results = verify_selected_replays(
+            selection,
+            records,
+            expected_inputs=input_provenance,
+            environment_manifest_sha256=manifest_hash,
+            required_environment_version=required_environment_version,
+            required_max_steps=required_max_steps,
+            env_factory=lambda: ShopAgentEnv(
+                base_url=args.base_url,
+                timeout=args.timeout,
+            ),
+        )
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(f"pivotal replay preflight failed: {exc}") from exc
+
+    selected_count = len(selection["selections"])
+    attempted = len(results)
+    if attempted != selected_count:
+        raise SystemExit("pivotal replay internal error: selected/result cardinality mismatch")
+    verified = sum(bool(result["verification"].get("verified")) for result in results)
+    all_selected_verified = bool(results) and verified == attempted == selected_count
     output = {
-        "schema_version": "shopping-pivotal-live-replay-audit-v1",
+        "schema_version": "shopping-pivotal-live-replay-audit-v2",
         "provenance": {
-            "input": str(input_path),
-            "input_sha256": _file_sha256(input_path),
+            "selection": str(selection_path),
+            "selection_sha256": selection_hash,
+            "inputs": input_provenance,
             "environment_manifest": str(manifest_path),
             "environment_manifest_sha256": manifest_hash,
             "required_environment_version": required_environment_version,
@@ -146,11 +181,16 @@ def main():
             "base_url": str(args.base_url),
         },
         "aggregate": {
-            "attempted_branches": len(results),
+            "selected_branches": selected_count,
+            "resolved_branches": attempted,
+            "attempted_branches": attempted,
             "verified_branches": verified,
-            "verification_rate": verified / len(results) if results else 0.0,
+            "failed_branches": attempted - verified,
+            "verification_rate": verified / attempted if attempted else 0.0,
+            "all_selected_verified": all_selected_verified,
         },
         "safety": {
+            "selection_outcome_blind": True,
             "uses_hidden_goal": False,
             "raw_environment_payloads_saved": False,
         },
@@ -162,6 +202,8 @@ def main():
         encoding="utf-8",
     )
     print(json.dumps(output["aggregate"], ensure_ascii=False, indent=2))
+    if not all_selected_verified:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
