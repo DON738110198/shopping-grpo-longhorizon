@@ -238,4 +238,31 @@ generation-config。
 version、manifest SHA 集合和 policy-reward config SHA，但这些字段尚未进入 group UID。进入训练
 前必须升级 plan v2，把 environment version 和 policy-reward SHA 纳入 plan/group identity。
 
+## 2 x 4 机械验证结果
+
+固定提交 `e3a7147` 上的真实 vLLM + ShopSimulator 机械验证已经完成：
+
+```text
+outputs/experiments/psa_grpo/active_suffix_smoke_sft_seed20260811_2x4_v1/
+```
+
+| 检查项 | 结果 |
+| --- | ---: |
+| exact prompt captures | 134 / 134 |
+| selected state live replay | 2 / 2 |
+| suffix cardinality | 2 x 4 = 8 / 8 |
+| infrastructure-invalid suffixes | 0 / 8 |
+| replay / tensor alignment | 8 / 8 |
+| strict-success suffixes | 7 / 8 |
+| action-credit eligible groups | 1 / 2 |
+
+两个 group 中，一个 group 的四条 suffix 出现三种首动作且 strict outcome 有差异；另一个
+group 的首动作和结果均相同，因此被正确排除。唯一失败 suffix 是模型提前结束，不是环境、
+token 或 replay 故障。全部八条 suffix 都是 `optimizer_enabled=false`，产物也未包含 hidden
+goal 字段。
+
+这些数字只证明“同一精确状态和 prompt 下能够得到可校验的分叉对照”，不能作为模型
+准确率或 PSA-GRPO 涨点。八条 suffix 中七条成功的比例没有统计意义，也没有运行
+Final-200。
+
 在这些门槛通过前，报告中的 `training_ready` 固定为 `false`，也不运行 Final-200。
