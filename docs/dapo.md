@@ -54,3 +54,49 @@ sampling-invalid rate is at most 5%.
 Promotion requires tuning strict success above the original SFT's `120/200`,
 with `wrong_purchase <= 5` and no guard/repeat regression. Otherwise DAPO is
 recorded as not improved and Final-200 is not run.
+
+## Result (2026-08-11)
+
+The controlled pilot ran on physical GPU 1 of `dy_10.191.245.63` from fixed
+commit `e09c09e8b53d7f3a4911fd4d7872c9fcfff48ce9`.
+
+The one-update smoke completed a real optimizer update with two effective
+groups, eight rollouts and no sampling-invalid group. The 25-update run then
+completed with exit code zero:
+
+| Training diagnostic | Result |
+| --- | ---: |
+| Effective groups | 58 / 98 (59.18%) |
+| Sampling-invalid groups | 4 / 98 (4.08%) |
+| Skipped updates | 2 |
+| Validation-50 strict at step 25 | 31 / 50 |
+
+The promotion evaluation used the frozen tuning-200 protocol:
+
+| Model | Strict | Mean Reward | Guard | Repeat | Wrong purchase |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Original SFT | 120 / 200 | 0.4559 | 86 | 35 | 5 |
+| GRPO V2 P0 | 123 / 200 | 0.4939 | 64 | 27 | 8 |
+| DAPO Clip-Higher | 119 / 200 | 0.4725 | 74 | 28 | 6 |
+
+Against SFT, DAPO produced 7 gains and 8 losses, for a strict-success delta of
+`-0.5` percentage points. The paired 95% bootstrap interval was `[-4.5, 3.5]`
+percentage points and the exact McNemar p-value was `1.0`.
+
+The pilot therefore failed both promotion requirements: strict success did not
+exceed 120 and wrong purchase exceeded 5. Final-200 was not run.
+
+This negative result is mechanically plausible. Across the 25 updates,
+`actor/pg_clipfrac` averaged only `0.215%` and peaked at `0.516%`; the dual-clip
+lower fraction was always zero. The changed clipping bounds were rarely active,
+so Clip-Higher could not repair the stopping and purchase-selection errors seen
+in the previous trajectory audit. This experiment rejects this narrow pilot,
+not the full DAPO recipe: response-mask-aware soft overlong shaping was not
+implemented, and only one seed and 25 updates were evaluated.
+
+Remote artifacts are under
+`outputs/experiments/dapo_v1/d0_cliphigher_lr1e6_n4_seed3407_25u_20260811_v1/`.
+They include the manifest, resolved config, complete log, sampling audit,
+rollouts, step-25 checkpoint, exported adapter, merged model, validation-50,
+tuning-200 trajectories, summary and paired comparison. The tuning trajectory
+SHA256 is `55bc20140f3fad79767029cf0d99e134ef32491df2b37dee804f74f4ca61da7d`.
