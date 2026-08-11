@@ -264,6 +264,34 @@ class ActorCheckpointRunAttestationTests(unittest.TestCase):
             ):
                 attestor.verify_runtime()
 
+    @unittest.skipIf(os.name == "nt", "Windows st_ctime is file creation time")
+    def test_runtime_ctime_detects_same_size_rewrite_with_restored_mtime(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            weights = root / "weights.bin"
+            weights.write_bytes(b"weights-v1")
+            actor_sha = sha256_actor_checkpoint(root)
+            attestor = ActorCheckpointRunAttestation(root, actor_sha)
+            baseline = weights.stat()
+
+            weights.write_bytes(b"weights-v2")
+            os.utime(
+                weights,
+                ns=(baseline.st_atime_ns, baseline.st_mtime_ns),
+            )
+            rewritten = weights.stat()
+
+            self.assertEqual(rewritten.st_size, baseline.st_size)
+            self.assertEqual(rewritten.st_ino, baseline.st_ino)
+            self.assertEqual(rewritten.st_mtime_ns, baseline.st_mtime_ns)
+            self.assertNotEqual(rewritten.st_ctime_ns, baseline.st_ctime_ns)
+            with self.assertRaisesRegex(
+                ActiveSuffixInfrastructureError, "drifted"
+            ):
+                attestor.verify_runtime()
+
     def test_start_and_end_full_hash_attestation_completes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

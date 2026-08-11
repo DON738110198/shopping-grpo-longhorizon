@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import stat
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -46,6 +47,7 @@ _NESTED_CONTINUATION_VERSION = "shopping-nested-continuation-v2"
 _NESTED_SEED_SCHEDULE_VERSION = "shopping-nested-state-crn-seed-v1"
 _NESTED_FOLD_CONTRACT_VERSION = "shopping-nested-train4-gate4-v1"
 _NESTED_ROLLOUT_CONTENT_VERSION = "shopping-nested-rollout-content-v2"
+_ACTOR_STAT_CLOCK_BARRIER_TIMEOUT_SECONDS = 5.0
 
 
 def _validate_record_request_intent_contract(
@@ -254,6 +256,82 @@ def _checkpoint_stat_snapshot(root: Path) -> dict[str, object]:
     }
 
 
+def _establish_checkpoint_stat_clock_barrier(
+    root: Path, snapshot: Mapping[str, object]
+) -> None:
+    """Advance the same-filesystem metadata clock beyond baseline ctimes."""
+    raw_entries = snapshot.get("entries")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        raise ActiveSuffixInfrastructureError(
+            "actor checkpoint stat snapshot is invalid",
+            code="actor_checkpoint_start_drift",
+        )
+    baseline_ctimes = {
+        entry.get("ctime_ns")
+        for entry in raw_entries
+        if isinstance(entry, Mapping)
+    }
+    root_device = raw_entries[0].get("device") if isinstance(
+        raw_entries[0], Mapping
+    ) else None
+    probe_parent = root.parent
+    try:
+        parent_stat = probe_parent.stat()
+    except OSError as exc:
+        raise ActiveSuffixInfrastructureError(
+            "actor checkpoint filesystem clock cannot be attested",
+            code="actor_checkpoint_start_drift",
+        ) from exc
+    if parent_stat.st_dev != root_device:
+        raise ActiveSuffixInfrastructureError(
+            "actor checkpoint parent is not on the checkpoint filesystem",
+            code="actor_checkpoint_start_drift",
+        )
+
+    probe = probe_parent / f".shopping-actor-stat-clock-{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            probe,
+            os.O_CREAT | os.O_EXCL | os.O_RDWR,
+            0o600,
+        )
+        deadline = time.monotonic() + _ACTOR_STAT_CLOCK_BARRIER_TIMEOUT_SECONDS
+        write_value = 0
+        while True:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, bytes([write_value]))
+            os.ftruncate(descriptor, 1)
+            os.fsync(descriptor)
+            if os.fstat(descriptor).st_ctime_ns not in baseline_ctimes:
+                break
+            if time.monotonic() >= deadline:
+                raise ActiveSuffixInfrastructureError(
+                    "actor checkpoint filesystem metadata clock did not advance",
+                    code="actor_checkpoint_start_drift",
+                )
+            write_value ^= 1
+            time.sleep(0.001)
+    except ActiveSuffixInfrastructureError:
+        raise
+    except OSError as exc:
+        raise ActiveSuffixInfrastructureError(
+            "actor checkpoint filesystem clock cannot be attested",
+            code="actor_checkpoint_start_drift",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ActiveSuffixInfrastructureError(
+                "actor checkpoint filesystem clock probe could not be removed",
+                code="actor_checkpoint_start_drift",
+            ) from exc
+        _fsync_directory(probe_parent)
+
+
 class ActorCheckpointRunAttestation:
     """Full-hash an actor at run boundaries and stat-check it in between."""
 
@@ -273,6 +351,7 @@ class ActorCheckpointRunAttestation:
             }
         )
         before = _checkpoint_stat_snapshot(self.root)
+        _establish_checkpoint_stat_clock_barrier(self.root, before)
         start_sha256 = sha256_actor_checkpoint(self.root)
         after = _checkpoint_stat_snapshot(self.root)
         if before != after:
