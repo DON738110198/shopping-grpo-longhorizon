@@ -21,6 +21,8 @@ from shopping_grpo.training.grpo.adapter.runtime import (
     current_runtime_state,
     record_action_attempt,
     record_action_outcome,
+    record_non_environment_decision,
+    record_replay_transition,
     validate_reward,
 )
 
@@ -29,6 +31,7 @@ try:  # 本地单测不安装 veRL；部署时由 veRL 注入真实类型。
     from verl.tools.schemas import ToolResponse
     from verl.utils.rollout_trace import rollout_trace_op
 except ImportError:  # pragma: no cover - 仅轻量开发环境使用
+
     class ToolResponse:
         def __init__(self, text=None, image=None, video=None):
             self.text, self.image, self.video = text, image, video
@@ -36,7 +39,11 @@ except ImportError:  # pragma: no cover - 仅轻量开发环境使用
     class BaseTool:
         def __init__(self, config, tool_schema):
             self.config, self.tool_schema = config, tool_schema
-            function = tool_schema.get("function", {}) if isinstance(tool_schema, dict) else tool_schema.function
+            function = (
+                tool_schema.get("function", {})
+                if isinstance(tool_schema, dict)
+                else tool_schema.function
+            )
             self.name = function.get("name") if isinstance(function, dict) else function.name
 
     def rollout_trace_op(function):
@@ -62,20 +69,42 @@ class ShopSimulatorTool(BaseTool):
         env = current_environment.get()
         state = current_runtime_state.get()
         if env is None or state is None:
-            raise RuntimeError("ShopSimulator tool executed without a trajectory-local interaction state")
+            raise RuntimeError(
+                "ShopSimulator tool executed without a trajectory-local interaction state"
+            )
         if state["done"] or state["terminate"]:
-            return ToolResponse(text="Error: environment is already terminal; do not call another tool."), 0.0, {}
+            return (
+                ToolResponse(
+                    text="Error: environment is already terminal; do not call another tool."
+                ),
+                0.0,
+                {},
+            )
         if len(state["steps"]) >= state["max_steps"]:
             _terminate(state, "max_steps")
-            return ToolResponse(text="Error: maximum executed tool steps reached."), 0.0, {"reason": "max_steps"}
+            return (
+                ToolResponse(text="Error: maximum executed tool steps reached."),
+                0.0,
+                {"reason": "max_steps"},
+            )
         parameters = parameters if isinstance(parameters, dict) else {}
         # think 不触碰环境，只记录一次模型决策；其余工具必须经过动作守卫。
         if self.name == "think":
+            record_non_environment_decision(
+                state,
+                "think",
+                parameters,
+                state.get("latest_observation", ""),
+            )
             step = _append_step(state, self.name, parameters)
             if len(state["steps"]) >= state["max_steps"]:
                 _terminate(state, "max_steps")
                 return ToolResponse(text="Error: maximum executed tool steps reached."), 0.0, step
-            return ToolResponse(text="Reasoning recorded. Continue with one environment tool call."), 0.0, step
+            return (
+                ToolResponse(text="Reasoning recorded. Continue with one environment tool call."),
+                0.0,
+                step,
+            )
         observation = state.get("latest_observation", "")
         action_event = record_action_attempt(state, self.name, parameters, observation)
         state["action_attempt_after_truncation_count"] += int(
@@ -86,6 +115,7 @@ class ShopSimulatorTool(BaseTool):
         reason = action_reject_reason(self.name, parameters, observation)
         if reason:
             record_action_outcome(
+                state,
                 action_event,
                 accepted=False,
                 guard_reason=reason,
@@ -97,23 +127,31 @@ class ShopSimulatorTool(BaseTool):
             state["consecutive_guard_rejections"] += 1
             if state["consecutive_guard_rejections"] >= 3:
                 _terminate(state, "too_many_guard_rejections")
-                return ToolResponse(text="Error: maximum consecutive action guard rejections reached."), 0.0, {
-                    "reason": reason
-                }
-            return ToolResponse(text=f"Error: action guard rejected this call ({reason}); read the latest observation."), 0.0, {"reason": reason}
+                return (
+                    ToolResponse(
+                        text="Error: maximum consecutive action guard rejections reached."
+                    ),
+                    0.0,
+                    {"reason": reason},
+                )
+            return (
+                ToolResponse(
+                    text=f"Error: action guard rejected this call ({reason}); read the latest observation."
+                ),
+                0.0,
+                {"reason": reason},
+            )
         try:
             # 先转换成环境动作，再在线程中调用同步客户端；终局 reward 只信任
             # 环境返回的 Reward v3 结构，避免训练侧自行猜测分数。
             action = tool_call_to_action(self.name, parameters)
             result = await asyncio.to_thread(env.step, action)
             if result.get("observation_state") is not None:
-                observation = render_structured_observation(
-                    result["observation_state"]
-                )
+                observation = render_structured_observation(result["observation_state"])
             else:
-                observation = str(
-                    result.get("instruction", result.get("observation", ""))
-                )
+                if not bool(result.get("done", False)):
+                    state["replay_observation_v2_complete"] = False
+                observation = str(result.get("instruction", result.get("observation", "")))
             step = _append_step(
                 state,
                 self.name,
@@ -123,6 +161,7 @@ class ShopSimulatorTool(BaseTool):
             )
         except Exception as exc:  # noqa: BLE001 - tool faults are recorded as infrastructure failures.
             record_action_outcome(
+                state,
                 action_event,
                 accepted=True,
                 error=f"{exc.__class__.__name__}:{exc}",
@@ -132,8 +171,19 @@ class ShopSimulatorTool(BaseTool):
                 f"tool_error:{exc.__class__.__name__}:{exc}",
                 infrastructure_invalid=True,
             )
-            return ToolResponse(text=f"Error: ShopSimulator tool execution failed: {exc}"), 0.0, {"error": state["error"]}
-        record_action_outcome(action_event, accepted=True)
+            return (
+                ToolResponse(text=f"Error: ShopSimulator tool execution failed: {exc}"),
+                0.0,
+                {"error": state["error"]},
+            )
+        record_action_outcome(state, action_event, accepted=True)
+        record_replay_transition(
+            state,
+            action_event,
+            parameters=parameters,
+            after_observation=None if step["done"] else observation,
+            done=bool(step["done"]),
+        )
         state["consecutive_guard_rejections"] = 0
         # done 只说明环境声明终局；还需同时验证 over、有限 reward 和 Reward v3 字段，
         # 才能把这条轨迹当成有效学习样本。
@@ -154,18 +204,12 @@ class ShopSimulatorTool(BaseTool):
                 reward_detail = result.get("reward_detail")
                 if (
                     isinstance(reward_detail, dict)
-                    and reward_detail.get("reward_version")
-                    == "shopsimulator-reward-v3"
+                    and reward_detail.get("reward_version") == "shopsimulator-reward-v3"
                 ):
                     try:
                         public_detail = validate_reward(reward_detail)
-                        if (
-                            public_detail.get("terminal_utility", step["reward"])
-                            != step["reward"]
-                        ):
-                            raise ValueError(
-                                "terminal_utility differs from terminal reward"
-                            )
+                        if public_detail.get("terminal_utility", step["reward"]) != step["reward"]:
+                            raise ValueError("terminal_utility differs from terminal reward")
                     except (TypeError, ValueError) as exc:
                         _mark_infrastructure_invalid(
                             state,
@@ -177,9 +221,7 @@ class ShopSimulatorTool(BaseTool):
                         state["reward_valid"] = public_detail["reward_valid"]
                         state["reward_unverifiable"] = not public_detail["reward_valid"]
                         state["reward_detail"] = public_detail
-                        state["termination_reason"] = public_detail[
-                            "termination_reason"
-                        ]
+                        state["termination_reason"] = public_detail["termination_reason"]
                 else:
                     _mark_infrastructure_invalid(
                         state,

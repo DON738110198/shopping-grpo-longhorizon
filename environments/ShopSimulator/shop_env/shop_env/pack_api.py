@@ -19,6 +19,9 @@ RETRY_DELAY_SECONDS = 5
 DEFAULT_ENV_MAX_NUM = int(os.environ.get("SHOPSIM_ENV_SLOTS", "20"))
 SERVER_HOST = '0.0.0.0'
 SERVER_PORT = int(os.environ.get("SHOPSIM_PORT", "5000"))
+ENVIRONMENT_MANIFEST_SHA256 = os.environ.get(
+    "SHOPSIM_ENVIRONMENT_MANIFEST_SHA256", ""
+)
 
 # Global variables
 envs: List[Any] = []
@@ -61,6 +64,7 @@ def api_some_function() -> Response:
     env_idx = data.get('env_idx', None)
     response = data.get('response', None)
     idx = data.get('idx', None)
+    lease_acquired_by_request = False
     try:
         # Release all environments
         if action == 'release_all':
@@ -88,6 +92,7 @@ def api_some_function() -> Response:
             while retry_count < MAX_RETRIES:
                 env_idx = slot_pool.acquire()
                 if env_idx is not None:
+                    lease_acquired_by_request = True
                     break
                 retry_count += 1
                 logger.info(f"[Retry {retry_count}/{MAX_RETRIES}] No available environment index, retrying in {RETRY_DELAY_SECONDS} seconds...")
@@ -99,6 +104,8 @@ def api_some_function() -> Response:
 
         # Call shop_agent function
         result = shop_agent(envs[env_idx], env_idx, action, idx, response)
+        if action == "reset" and ENVIRONMENT_MANIFEST_SHA256:
+            result["environment_manifest_sha256"] = ENVIRONMENT_MANIFEST_SHA256
 
         # The caller owns the lease until release_one.  Auto-releasing here
         # races with the caller's finally-release: another worker can lease
@@ -108,12 +115,26 @@ def api_some_function() -> Response:
             logger.info(
                 f"[Task Over] Environment {env_idx} is awaiting explicit release"
             )
+        return jsonify({'result': result})
 
     except Exception as e:
+        # A reset request acquires its slot before calling shop_agent.  If reset
+        # then fails, the client never receives env_idx and cannot release the
+        # lease in its own finally block.  Only release slots acquired by this
+        # request; a failing interact request still belongs to its caller.
+        if lease_acquired_by_request and env_idx is not None:
+            try:
+                slot_pool.release(env_idx)
+                logger.info(
+                    f"[Release] Environment {env_idx} released after request failure"
+                )
+            except Exception:
+                logger.exception(
+                    f"[Release] Failed to release environment {env_idx} "
+                    "after request failure"
+                )
         logger.exception(f"[Exception] Exception occurred while processing request: {str(e)}")
         return jsonify({'result': {'error': str(e)}})
-
-    return jsonify({'result': result})
 
 
 def initialize_environments() -> None:

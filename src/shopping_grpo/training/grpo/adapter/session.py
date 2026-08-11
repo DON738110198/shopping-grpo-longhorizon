@@ -10,7 +10,12 @@ import asyncio
 
 from shopping_grpo.environment.client import ShopAgentEnv
 from shopping_grpo.environment.observation import render_structured_observation
-from shopping_grpo.training.grpo.adapter.runtime import current_environment, current_runtime_state, make_runtime_state
+from shopping_grpo.training.grpo.adapter.runtime import (
+    current_environment,
+    current_runtime_state,
+    make_runtime_state,
+)
+from shopping_grpo.training.grpo.pivotal_states import observation_sha256
 
 
 class ShopSimulatorSession:
@@ -26,12 +31,14 @@ class ShopSimulatorSession:
         timeout: int = 60,
         max_steps: int = 35,
         required_environment_version: str | None = None,
+        required_environment_manifest_sha256: str | None = None,
         env_factory=None,
     ):
         self.base_url = base_url
         self.timeout = int(timeout)
         self.max_steps = int(max_steps)
         self.required_environment_version = required_environment_version
+        self.required_environment_manifest_sha256 = required_environment_manifest_sha256
         self.env_factory = env_factory or ShopAgentEnv
         self.env = None
         self.state = None
@@ -54,9 +61,13 @@ class ShopSimulatorSession:
             raise
 
         self.state = make_runtime_state(task_id=task_id, max_steps=self.max_steps)
-        actual_version = (
-            initial.get("environment_version") if isinstance(initial, dict) else None
+        public_query = (
+            initial.get("instruction", initial.get("observation", ""))
+            if isinstance(initial, dict)
+            else str(initial)
         )
+        self.state["public_query_sha256"] = observation_sha256(public_query)
+        actual_version = initial.get("environment_version") if isinstance(initial, dict) else None
         if (
             self.required_environment_version is not None
             and actual_version != self.required_environment_version
@@ -69,17 +80,40 @@ class ShopSimulatorSession:
                 "ShopSimulator environment version mismatch: "
                 f"expected {self.required_environment_version!r}, got {actual_version!r}"
             )
+        actual_manifest_sha256 = (
+            initial.get("environment_manifest_sha256")
+            if isinstance(initial, dict)
+            else None
+        )
+        if (
+            self.required_environment_manifest_sha256 is not None
+            and actual_manifest_sha256 != self.required_environment_manifest_sha256
+        ):
+            try:
+                await asyncio.to_thread(self.env.release)
+            finally:
+                self.env = None
+            raise RuntimeError(
+                "ShopSimulator environment manifest mismatch: "
+                f"expected {self.required_environment_manifest_sha256!r}, "
+                f"got {actual_manifest_sha256!r}"
+            )
         if isinstance(initial, dict) and initial.get("observation_state") is not None:
             self.state["latest_observation"] = render_structured_observation(
                 initial["observation_state"]
             )
-            self.state["environment_version"] = actual_version
+            self.state["replay_observation_v2_complete"] = True
         else:
             self.state["latest_observation"] = str(
                 initial.get("instruction", initial.get("observation", ""))
                 if isinstance(initial, dict)
                 else initial
             )
+        self.state["latest_observation_raw"] = self.state["latest_observation"]
+        self.state["initial_public_observation_sha256"] = observation_sha256(
+            self.state["latest_observation_raw"]
+        )
+        self.state["environment_version"] = actual_version
         # ContextVar.set 返回 token；close 时用 token 恢复进入 session 前的值。
         # 这不是模型 token，而是 Python contextvars 的回滚句柄。
         self._environment_token = current_environment.set(self.env)

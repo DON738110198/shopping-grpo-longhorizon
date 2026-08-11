@@ -13,6 +13,15 @@ import math
 from collections.abc import Mapping
 from contextvars import ContextVar
 
+from shopping_grpo.training.grpo.pivotal_states import (
+    REPLAY_STATE_VERSION,
+    canonical_replay_parameters,
+    observation_sha256,
+    replay_action_sha256,
+    replay_state_id,
+)
+from shopping_grpo.training.grpo.pivotal_states import branch_uid as make_branch_uid
+
 current_environment: ContextVar = ContextVar("shopsimulator_environment", default=None)
 current_runtime_state: ContextVar = ContextVar("shopsimulator_runtime_state", default=None)
 POLICY_REWARD_VERSION = "shopping-policy-reward-v1"
@@ -64,6 +73,17 @@ def make_runtime_state(task_id: int, max_steps: int) -> dict:
         "repeat_action_count": 0,
         "recent_action_signatures": [],
         "action_events": [],
+        "decision_events": [],
+        "decision_count": 0,
+        "replay_ledger": [],
+        "assistant_turn_records": [],
+        "next_assistant_turn_id": 0,
+        "current_assistant_turn_id": None,
+        "environment_manifest_sha256": None,
+        "public_query_sha256": None,
+        "initial_public_observation_sha256": None,
+        "replay_observation_v2_complete": False,
+        "replay_contract_error": None,
         "terminal_result": {},
         "final_reward": 0.0,
         "reward_version": None,
@@ -107,13 +127,11 @@ def record_observation_projection(state: dict, meta: dict) -> None:
     )
     state["observation_visible_asin_count"] += int(meta["visible_asin_count"])
     state["observation_visible_button_count"] += int(meta["visible_button_count"])
-    state["observation_any_truncated"] = (
-        state["observation_any_truncated"] or bool(meta["truncated"])
+    state["observation_any_truncated"] = state["observation_any_truncated"] or bool(
+        meta["truncated"]
     )
     state["latest_observation_truncated"] = bool(meta["truncated"])
-    state["observation_footer_failures"] += int(
-        not bool(meta["critical_footer_preserved"])
-    )
+    state["observation_footer_failures"] += int(not bool(meta["critical_footer_preserved"]))
 
 
 def _bounded_parameters(parameters: dict) -> dict:
@@ -129,13 +147,106 @@ def _bounded_parameters(parameters: dict) -> dict:
     return bounded
 
 
+def _record_decision_event(
+    state: dict,
+    tool_name: str,
+    parameters: dict,
+    observation: str,
+    *,
+    decision_kind: str,
+    repeated: bool,
+) -> dict:
+    """Record one policy-visible decision without changing environment counters."""
+    observation_fingerprint = hashlib.sha256(str(observation).encode("utf-8")).hexdigest()
+    raw_observation_fingerprint = observation_sha256(
+        state.get("latest_observation_raw", observation)
+    )
+    accepted_prefix = [
+        {
+            "tool": item["tool"],
+            "parameters": item["parameters"],
+        }
+        for item in state.get("replay_ledger", [])
+    ]
+    manifest_sha256 = str(state.get("environment_manifest_sha256") or "")
+    query_sha256 = str(state.get("public_query_sha256") or "")
+    replay_fingerprint = replay_state_id(
+        int(state["task_id"]),
+        accepted_prefix,
+        raw_observation_fingerprint,
+        observation_kind="raw_public_observation",
+        environment_manifest_sha256=manifest_sha256,
+        public_query_sha256=query_sha256,
+    )
+    current_turn_id = state.get("current_assistant_turn_id")
+    turn_record = next(
+        (
+            item
+            for item in reversed(state.get("assistant_turn_records", []))
+            if item.get("turn_id") == current_turn_id
+        ),
+        {},
+    )
+    actor_prompt_sha256 = str(turn_record.get("actor_prompt_sha256") or "")
+    tokenizer_fingerprint = str(turn_record.get("tokenizer_contract_sha256") or "")
+    try:
+        replay_parameters = canonical_replay_parameters(parameters)
+        action_fingerprint = replay_action_sha256(tool_name, replay_parameters)
+    except (TypeError, ValueError):
+        replay_parameters = None
+        action_fingerprint = None
+        state["replay_contract_error"] = "invalid_exact_action_parameters"
+    prompt_branch_uid = (
+        make_branch_uid(
+            replay_fingerprint,
+            actor_prompt_sha256,
+            tokenizer_fingerprint,
+        )
+        if manifest_sha256
+        and query_sha256
+        and actor_prompt_sha256
+        and tokenizer_fingerprint
+        and state.get("replay_observation_v2_complete") is True
+        and state.get("replay_contract_error") is None
+        and action_fingerprint is not None
+        else None
+    )
+    decision_index = int(state["decision_count"])
+    state["decision_count"] = decision_index + 1
+    event = {
+        "decision_index": decision_index,
+        "decision_kind": str(decision_kind),
+        "tool": str(tool_name),
+        "parameters": _bounded_parameters(parameters),
+        "replay_parameters": replay_parameters,
+        "action_sha256": action_fingerprint,
+        "observation_sha256": observation_fingerprint,
+        "raw_observation_sha256": raw_observation_fingerprint,
+        "replay_state_version": REPLAY_STATE_VERSION,
+        "replay_state_id": replay_fingerprint,
+        "branch_uid": prompt_branch_uid,
+        "branch_identity_complete": prompt_branch_uid is not None,
+        "actor_prompt_sha256": actor_prompt_sha256 or None,
+        "tokenizer_contract_sha256": tokenizer_fingerprint or None,
+        "prefix_action_count": len(accepted_prefix),
+        "assistant_turn_id": current_turn_id,
+        "repeated": repeated,
+        "accepted": None,
+        "guard_reason": None,
+        "error": None,
+    }
+    state["decision_events"].append(event)
+    del state["decision_events"][:-ACTION_TRACE_LIMIT]
+    return event
+
+
 def record_action_attempt(
     state: dict,
     tool_name: str,
     parameters: dict,
     observation: str,
 ) -> dict | None:
-    """Record a public action summary and detect a repeat on the recent page state."""
+    """Record a public environment action and detect repeats on the recent page state."""
     if tool_name == "think":
         return None
     canonical_parameters = json.dumps(
@@ -153,22 +264,92 @@ def record_action_attempt(
         state["repeat_action_count"] += 1
     recent.append(signature)
     del recent[:-3]
-    event = {
-        "index": state["action_attempt_count"] - 1,
-        "tool": str(tool_name),
-        "parameters": _bounded_parameters(parameters),
-        "observation_sha256": observation_fingerprint,
-        "repeated": repeated,
-        "accepted": None,
-        "guard_reason": None,
-        "error": None,
-    }
-    state["action_events"].append(event)
+    event = _record_decision_event(
+        state,
+        tool_name,
+        parameters,
+        observation,
+        decision_kind="environment_tool",
+        repeated=repeated,
+    )
+    event["index"] = state["action_attempt_count"] - 1
+    state["action_events"].append(
+        {
+            "index": event["index"],
+            "decision_index": event["decision_index"],
+            "tool": event["tool"],
+            "parameters": event["parameters"],
+            "action_sha256": event["action_sha256"],
+            "observation_sha256": event["observation_sha256"],
+            "repeated": event["repeated"],
+            "accepted": event["accepted"],
+            "guard_reason": event["guard_reason"],
+            "error": event["error"],
+        }
+    )
     del state["action_events"][:-ACTION_TRACE_LIMIT]
     return event
 
 
+def record_non_environment_decision(
+    state: dict,
+    decision_name: str,
+    parameters: dict,
+    observation: str,
+) -> dict:
+    """Record `think` or a final Assistant response without changing replay state."""
+    return _record_decision_event(
+        state,
+        decision_name,
+        parameters,
+        observation,
+        decision_kind=str(decision_name),
+        repeated=False,
+    )
+
+
+def record_replay_transition(
+    state: dict,
+    event: dict | None,
+    *,
+    parameters: Mapping[str, object],
+    after_observation: str | None,
+    done: bool,
+) -> None:
+    """Append one confirmed environment transition to the replay-only ledger."""
+    if event is None or event.get("accepted") is not True or event.get("error"):
+        return
+    tool = str(event.get("tool") or "")
+    if tool == "think":
+        return
+    if not done and not after_observation:
+        state["replay_contract_error"] = "missing_nonterminal_public_observation"
+        return
+    try:
+        exact_parameters = canonical_replay_parameters(parameters)
+    except (TypeError, ValueError):
+        state["replay_contract_error"] = "invalid_exact_action_parameters"
+        return
+    if event.get("replay_parameters") != exact_parameters or event.get(
+        "action_sha256"
+    ) != replay_action_sha256(tool, exact_parameters):
+        state["replay_contract_error"] = "action_event_replay_mismatch"
+        return
+    after_hash = None if done else observation_sha256(after_observation)
+    state["replay_ledger"].append(
+        {
+            "sequence": len(state["replay_ledger"]),
+            "tool": tool,
+            "parameters": exact_parameters,
+            "before_public_observation_sha256": event["raw_observation_sha256"],
+            "after_public_observation_sha256": after_hash,
+            "done": bool(done),
+        }
+    )
+
+
 def record_action_outcome(
+    state: dict,
     event: dict | None,
     *,
     accepted: bool,
@@ -181,6 +362,12 @@ def record_action_outcome(
     event["accepted"] = bool(accepted)
     event["guard_reason"] = str(guard_reason) if guard_reason else None
     event["error"] = str(error)[:512] if error else None
+    for action_event in reversed(state.get("action_events", [])):
+        if action_event.get("decision_index") == event.get("decision_index"):
+            action_event["accepted"] = event["accepted"]
+            action_event["guard_reason"] = event["guard_reason"]
+            action_event["error"] = event["error"]
+            break
 
 
 def validate_reward(raw_detail: object) -> dict:
@@ -248,10 +435,7 @@ def validate_reward(raw_detail: object) -> dict:
         evidence_coverage = float(raw_detail.get("evidence_coverage", 0.0))
     except (TypeError, ValueError) as exc:
         raise ValueError("evidence_coverage must be numeric") from exc
-    if (
-        not math.isfinite(evidence_coverage)
-        or not 0.0 <= evidence_coverage <= 1.0
-    ):
+    if not math.isfinite(evidence_coverage) or not 0.0 <= evidence_coverage <= 1.0:
         raise ValueError("evidence_coverage must be finite and in [0, 1]")
     raw_dimension_scores = raw_detail.get("dimension_scores") or {}
     if not isinstance(raw_dimension_scores, Mapping):
@@ -263,9 +447,7 @@ def validate_reward(raw_detail: object) -> dict:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"dimension score {name} must be numeric") from exc
         if not math.isfinite(score) or not 0.0 <= score <= 1.0:
-            raise ValueError(
-                f"dimension score {name} must be finite and in [0, 1]"
-            )
+            raise ValueError(f"dimension score {name} must be finite and in [0, 1]")
         dimension_scores[name] = score
     return {
         "reward_version": "shopsimulator-reward-v3",
@@ -286,9 +468,7 @@ def validate_reward(raw_detail: object) -> dict:
 def _normal_terminal(state: dict) -> bool:
     terminal = state.get("terminal_result") or {}
     return (
-        state.get("done") is True
-        and terminal.get("done") is True
-        and terminal.get("over") is True
+        state.get("done") is True and terminal.get("done") is True and terminal.get("over") is True
     )
 
 
@@ -298,7 +478,9 @@ def validate_policy_reward_config(raw_config: object = None) -> dict:
     if not isinstance(raw_config, Mapping):
         raise TypeError("policy_reward config must be an object")
     config = dict(DEFAULT_POLICY_REWARD_CONFIG)
-    config.update({key: value for key, value in raw_config.items() if key != "model_failure_rewards"})
+    config.update(
+        {key: value for key, value in raw_config.items() if key != "model_failure_rewards"}
+    )
     failure_rewards = dict(DEFAULT_POLICY_REWARD_CONFIG["model_failure_rewards"])
     raw_failures = raw_config.get("model_failure_rewards", {})
     if not isinstance(raw_failures, Mapping):
@@ -366,9 +548,7 @@ def reward_breakdown(
     termination_reason = str(state.get("termination_reason") or "")
     failure_rewards = config["model_failure_rewards"]
     model_failure = (
-        not normal_terminal
-        and not infrastructure_invalid
-        and termination_reason in failure_rewards
+        not normal_terminal and not infrastructure_invalid and termination_reason in failure_rewards
     )
 
     invalid_reason = None
@@ -387,8 +567,7 @@ def reward_breakdown(
     full = float(valid_terminal and state.get("reward_type") == "gold_purchase")
     purchase_success = bool(
         valid_terminal
-        and state.get("reward_type")
-        in {"gold_purchase", "valid_alternative_purchase"}
+        and state.get("reward_type") in {"gold_purchase", "valid_alternative_purchase"}
     )
     policy_base = native if valid_terminal else float(failure_rewards.get(termination_reason, 0.0))
 
@@ -402,12 +581,8 @@ def reward_breakdown(
     )
     # Model-failure values are fixed anchors. Behavior penalties only refine otherwise
     # valid environment terminals, so each exceptional termination hits its documented score.
-    penalty_guard = (
-        guard_count * config["guard_rejection_penalty"] if valid_terminal else 0.0
-    )
-    penalty_repeat = (
-        repeat_count * config["repeat_action_penalty"] if valid_terminal else 0.0
-    )
+    penalty_guard = guard_count * config["guard_rejection_penalty"] if valid_terminal else 0.0
+    penalty_repeat = repeat_count * config["repeat_action_penalty"] if valid_terminal else 0.0
     total = 0.0
     if valid_for_learning:
         total = min(
@@ -433,8 +608,12 @@ def reward_breakdown(
         "native": native,
         "semantic": float(purchase_success),
         "efficiency": 0.0,
-        "penalty_overlong": abs(policy_base) if termination_reason in {"max_steps", "context_hard_limit_exceeded"} else 0.0,
-        "penalty_unfinished": abs(policy_base) if termination_reason == "assistant_finished_without_environment_done" else 0.0,
+        "penalty_overlong": abs(policy_base)
+        if termination_reason in {"max_steps", "context_hard_limit_exceeded"}
+        else 0.0,
+        "penalty_unfinished": abs(policy_base)
+        if termination_reason == "assistant_finished_without_environment_done"
+        else 0.0,
         "penalty_guard": penalty_guard,
         "penalty_repeat": penalty_repeat,
         "repeat_action_rate": int(state.get("repeat_action_count", 0)) / action_attempts,

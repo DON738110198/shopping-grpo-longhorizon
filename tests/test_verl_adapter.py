@@ -3,16 +3,20 @@
 import asyncio
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
-from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 
 from shopping_grpo.training.grpo.adapter.agent_loop import ShoppingToolAgentLoop
 from shopping_grpo.training.grpo.adapter.runtime import (
     current_environment,
     current_runtime_state,
     make_runtime_state,
+    record_action_attempt,
+    record_action_outcome,
+    record_replay_transition,
     reward_breakdown,
     task_id_from_kwargs,
     terminal_reward,
@@ -39,7 +43,107 @@ def make_tool(name):
     return ShopSimulatorTool({}, tool_schema)
 
 
+class FakeGenerationTokenizer:
+    def __init__(self):
+        self.name_or_path = "test-tokenizer"
+        self.chat_template = "test-template"
+        self.vocab_size = 128
+        self.all_special_ids = [0]
+        self.init_kwargs = {"_commit_hash": "test-commit"}
+
+    @staticmethod
+    def get_added_vocab():
+        return {}
+
+
+class FakeGenerationServer:
+    def __init__(self, token_ids):
+        self.token_ids = list(token_ids)
+
+    async def generate(self, **kwargs):
+        del kwargs
+        return SimpleNamespace(
+            token_ids=self.token_ids,
+            log_probs=None,
+            num_preempted=0,
+            extra_fields={},
+            routed_experts=None,
+        )
+
+
+def make_generation_loop(*, response_length, max_assistant_turns):
+    loop = object.__new__(ShoppingToolAgentLoop)
+    loop.context_compaction_enable = False
+    loop.context_window_tokens = 128
+    loop.context_generation_reserve_tokens = 32
+    loop.context_safety_margin_tokens = 8
+    loop.context_input_budget = 64
+    loop.context_preserve_recent_groups = 1
+    loop.response_length = response_length
+    loop.max_assistant_turns = max_assistant_turns
+    loop.max_user_turns = 40
+    loop.tool_parser = SimpleNamespace(stop_token_ids=[])
+    loop.server_manager = FakeGenerationServer([11, 12, 13])
+    loop.tokenizer = FakeGenerationTokenizer()
+    return loop
+
+
+def make_agent_data():
+    agent_data = AgentData(
+        messages=[],
+        image_data=[],
+        video_data=[],
+        audio_data=None,
+        mm_processor_kwargs={},
+        metrics={},
+        request_id="test-request",
+        tools_kwargs={},
+    )
+    agent_data.prompt_ids = [101]
+    return agent_data
+
+
 class VerlAdapterRuntimeTest(unittest.TestCase):
+    def test_response_length_limit_is_not_recorded_as_assistant_final(self):
+        async def run():
+            loop = make_generation_loop(response_length=3, max_assistant_turns=40)
+            agent_data = make_agent_data()
+            state = make_runtime_state(task_id=1, max_steps=35)
+            token = current_runtime_state.set(state)
+            try:
+                next_state = await loop._handle_generating_state(agent_data, {})
+            finally:
+                current_runtime_state.reset(token)
+            return next_state, state
+
+        next_state, state = asyncio.run(run())
+        self.assertEqual(next_state, AgentState.TERMINATED)
+        self.assertEqual(state["decision_events"], [])
+        self.assertEqual(len(state["assistant_turn_records"]), 1)
+        turn = state["assistant_turn_records"][0]
+        self.assertEqual(turn["generation_termination_reason"], "response_length")
+        self.assertFalse(turn["credit_eligible"])
+
+    def test_max_assistant_turns_limit_is_not_recorded_as_assistant_final(self):
+        async def run():
+            loop = make_generation_loop(response_length=32, max_assistant_turns=1)
+            agent_data = make_agent_data()
+            state = make_runtime_state(task_id=1, max_steps=35)
+            token = current_runtime_state.set(state)
+            try:
+                next_state = await loop._handle_generating_state(agent_data, {})
+            finally:
+                current_runtime_state.reset(token)
+            return next_state, state
+
+        next_state, state = asyncio.run(run())
+        self.assertEqual(next_state, AgentState.TERMINATED)
+        self.assertEqual(state["decision_events"], [])
+        self.assertEqual(len(state["assistant_turn_records"]), 1)
+        turn = state["assistant_turn_records"][0]
+        self.assertEqual(turn["generation_termination_reason"], "max_assistant_turns")
+        self.assertFalse(turn["credit_eligible"])
+
     def test_agent_loop_preserves_real_verl_metrics_and_exports_shopping_diagnostics(self):
         created = []
 
@@ -125,7 +229,9 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
 
     def test_terminal_reward_only_uses_a_normal_environment_completion(self):
         done = make_runtime_state(task_id=1, max_steps=35)
-        done.update({"done": True, "terminal_result": {"done": True, "over": True}, "final_reward": 0.75})
+        done.update(
+            {"done": True, "terminal_result": {"done": True, "over": True}, "final_reward": 0.75}
+        )
         self.assertEqual(terminal_reward(done), 0.75)
 
         unfinished = make_runtime_state(task_id=1, max_steps=35)
@@ -155,6 +261,66 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
         state = make_runtime_state(task_id=2, max_steps=35)
         self.assertNotIn("goal", state)
         self.assertIsNone(state["reward_detail"])
+
+    def test_action_attempt_records_replay_and_exact_prompt_contract(self):
+        state = make_runtime_state(task_id=2, max_steps=35)
+        state["latest_observation_raw"] = "public product page"
+        state["environment_manifest_sha256"] = "a" * 64
+        state["public_query_sha256"] = "b" * 64
+        state["replay_observation_v2_complete"] = True
+        state["current_assistant_turn_id"] = 3
+        state["assistant_turn_records"].append(
+            {
+                "turn_id": 3,
+                "actor_prompt_sha256": "c" * 64,
+                "tokenizer_contract_sha256": "d" * 64,
+            }
+        )
+
+        event = record_action_attempt(
+            state,
+            "open_product",
+            {"asin": "123"},
+            "projected product page",
+        )
+        self.assertTrue(event["branch_identity_complete"])
+        self.assertEqual(event["assistant_turn_id"], 3)
+        self.assertEqual(len(event["replay_state_id"]), 64)
+        self.assertEqual(len(event["branch_uid"]), 64)
+        record_action_outcome(state, event, accepted=True)
+        record_replay_transition(
+            state,
+            event,
+            parameters={"asin": "123"},
+            after_observation="next public page",
+            done=False,
+        )
+        self.assertEqual(state["replay_ledger"][0]["tool"], "open_product")
+        self.assertNotIn("public product page", str(state["replay_ledger"]))
+
+    def test_replay_ledger_keeps_exact_parameters_while_audit_summary_is_bounded(self):
+        state = make_runtime_state(task_id=2, max_steps=35)
+        state["latest_observation_raw"] = "public search page"
+        query = "q" * 300
+        event = record_action_attempt(
+            state,
+            "search_products",
+            {"query": query},
+            "projected search page",
+        )
+        record_action_outcome(state, event, accepted=True)
+        record_replay_transition(
+            state,
+            event,
+            parameters={"query": query},
+            after_observation="results",
+            done=False,
+        )
+        self.assertEqual(len(event["parameters"]["query"]), 256)
+        self.assertEqual(event["replay_parameters"]["query"], query)
+        self.assertEqual(len(state["action_events"][0]["parameters"]["query"]), 256)
+        self.assertNotIn("replay_parameters", state["action_events"][0])
+        self.assertEqual(state["replay_ledger"][0]["parameters"]["query"], query)
 
     def test_task_id_is_read_from_verl_extra_info(self):
         self.assertEqual(task_id_from_kwargs({"extra_info": {"task_id": 42}}), 42)
@@ -308,9 +474,7 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
             env_token = current_environment.set(FakeEnv())
             state_token = current_runtime_state.set(state)
             try:
-                await make_tool("search_products").execute(
-                    "tool-v2", {"query": "mug"}
-                )
+                await make_tool("search_products").execute("tool-v2", {"query": "mug"})
             finally:
                 current_runtime_state.reset(state_token)
                 current_environment.reset(env_token)
@@ -475,7 +639,9 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
         async def run():
             session = ShopSimulatorSession(max_steps=35, env_factory=FakeEnv)
             state = await session.start(task_id=8)
-            state.update({"done": True, "terminal_result": {"done": True, "over": True}, "final_reward": 1.0})
+            state.update(
+                {"done": True, "terminal_result": {"done": True, "over": True}, "final_reward": 1.0}
+            )
             self.assertEqual(terminal_reward(state), 1.0)
             await session.close()
 
@@ -531,6 +697,36 @@ class VerlAdapterRuntimeTest(unittest.TestCase):
                 env_factory=FakeEnv,
             )
             with self.assertRaisesRegex(RuntimeError, "version mismatch"):
+                await session.start(1)
+
+        asyncio.run(run())
+        self.assertTrue(created[0].released)
+
+    def test_session_rejects_wrong_environment_manifest_and_releases(self):
+        created = []
+
+        class FakeEnv:
+            def __init__(self, **kwargs):
+                self.released = False
+                created.append(self)
+
+            def reset(self, task_id):
+                return {
+                    "instruction": f"task {task_id}",
+                    "environment_version": "shopsimulator-environment-v2.1",
+                    "environment_manifest_sha256": "b" * 64,
+                }
+
+            def release(self):
+                self.released = True
+
+        async def run():
+            session = ShopSimulatorSession(
+                required_environment_version="shopsimulator-environment-v2.1",
+                required_environment_manifest_sha256="a" * 64,
+                env_factory=FakeEnv,
+            )
+            with self.assertRaisesRegex(RuntimeError, "manifest mismatch"):
                 await session.start(1)
 
         asyncio.run(run())

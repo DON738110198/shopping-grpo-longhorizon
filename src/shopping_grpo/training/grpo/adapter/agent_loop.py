@@ -12,16 +12,20 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
 
 from shopping_grpo.environment.context import ContextBudgetError, compact_token_trajectory
+from shopping_grpo.environment.manifest import sha256_file
 from shopping_grpo.environment.projection import (
     ObservationProjectionError,
     project_observation,
 )
 from shopping_grpo.training.grpo.adapter.runtime import (
     current_runtime_state,
+    record_non_environment_decision,
     record_observation_projection,
     reward_breakdown,
     task_id_from_kwargs,
@@ -29,6 +33,13 @@ from shopping_grpo.training.grpo.adapter.runtime import (
     validate_policy_reward_config,
 )
 from shopping_grpo.training.grpo.adapter.session import ShopSimulatorSession
+from shopping_grpo.training.grpo.pivotal_states import (
+    REPLAY_STATE_VERSION,
+    TURN_SPAN_VERSION,
+    materialize_assistant_turn_spans,
+    token_ids_sha256,
+    tokenizer_contract_sha256,
+)
 
 
 class ShoppingToolAgentLoop(ToolAgentLoop):
@@ -85,17 +96,26 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
         self.context_input_budget = self.context_input_budget_tokens
         if self.context_preserve_recent_groups < 1:
             raise ValueError("context_preserve_recent_groups must be positive")
-        if min(
-            self.observation_token_budget,
-            self.observation_detail_token_budget,
-            self.observation_generic_token_budget,
-        ) < 64:
+        if (
+            min(
+                self.observation_token_budget,
+                self.observation_detail_token_budget,
+                self.observation_generic_token_budget,
+            )
+            < 64
+        ):
             raise ValueError("all observation token budgets must be at least 64")
         if self.observation_search_top_k < 1:
             raise ValueError("observation_search_top_k must be positive")
         if self.reward_mode not in {"native", "policy_v1"}:
             raise ValueError(f"unknown shopping reward mode: {self.reward_mode!r}")
         self.env_factory = env_factory
+        manifest_path = os.environ.get("SHOPPING_ENV_MANIFEST")
+        self.environment_manifest_sha256 = (
+            sha256_file(Path(manifest_path))
+            if manifest_path and Path(manifest_path).is_file()
+            else None
+        )
 
     async def _handle_generating_state(
         self,
@@ -154,7 +174,9 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             if agent_data.routed_experts is not None:
                 if runtime_state is not None:
                     runtime_state["terminate"] = True
-                    runtime_state["termination_reason"] = "context_compaction_unsupported_routed_experts"
+                    runtime_state["termination_reason"] = (
+                        "context_compaction_unsupported_routed_experts"
+                    )
                     runtime_state["error"] = runtime_state["termination_reason"]
                     runtime_state["infrastructure_invalid"] = True
                 return AgentState.TERMINATED
@@ -164,17 +186,87 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             if runtime_state is not None:
                 runtime_state["context_compactions"] += 1
                 runtime_state["context_tokens_removed"] += stats.removed_tokens
+                records = runtime_state["assistant_turn_records"]
+                removed_records = records[: stats.removed_groups]
+                if len(removed_records) != stats.removed_groups or any(
+                    record.get("kind") != "tool_call" for record in removed_records
+                ):
+                    runtime_state["terminate"] = True
+                    runtime_state["termination_reason"] = "turn_record_compaction_mismatch"
+                    runtime_state["error"] = runtime_state["termination_reason"]
+                    runtime_state["infrastructure_invalid"] = True
+                    return AgentState.TERMINATED
+                del records[: stats.removed_groups]
         bounded_sampling_params = dict(sampling_params)
         if "max_tokens" in bounded_sampling_params:
             bounded_sampling_params["max_tokens"] = min(
                 int(bounded_sampling_params["max_tokens"]),
                 self.context_generation_reserve_tokens,
             )
-        return await super()._handle_generating_state(
+        prompt_fingerprint = token_ids_sha256(agent_data.prompt_ids)
+        tokenizer_fingerprint = tokenizer_contract_sha256(self.tokenizer)
+        response_tokens_before = len(agent_data.response_mask)
+        next_state = await super()._handle_generating_state(
             agent_data,
             bounded_sampling_params,
             ignore_termination=ignore_termination,
         )
+        response_tokens_after = len(agent_data.response_mask)
+        generated_token_count = response_tokens_after - response_tokens_before
+        if runtime_state is not None:
+            turn_id = int(runtime_state["next_assistant_turn_id"])
+            runtime_state["next_assistant_turn_id"] = turn_id + 1
+            is_tool_turn = next_state == AgentState.PROCESSING_TOOLS
+            harness_limit_reason = None
+            if next_state == AgentState.TERMINATED:
+                # veRL 0.8 checks these limits before parsing tool calls. A complete
+                # tool-call generation that hits a limit is therefore not evidence
+                # that the model chose to emit a final Assistant answer.
+                if not ignore_termination and response_tokens_after >= self.response_length:
+                    harness_limit_reason = "response_length"
+                elif (
+                    self.max_assistant_turns
+                    and agent_data.assistant_turns >= self.max_assistant_turns
+                ):
+                    harness_limit_reason = "max_assistant_turns"
+                elif self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+                    harness_limit_reason = "max_user_turns"
+            natural_assistant_final = (
+                next_state == AgentState.TERMINATED and harness_limit_reason is None
+            )
+            tool_names = (
+                [str(tool_call.name) for tool_call in agent_data.tool_calls] if is_tool_turn else []
+            )
+            runtime_state["assistant_turn_records"].append(
+                {
+                    "turn_id": turn_id,
+                    "kind": "tool_call" if is_tool_turn else "assistant_termination",
+                    "tool_names": tool_names,
+                    "tool_call_count": len(tool_names),
+                    "generated_token_count": generated_token_count,
+                    "actor_prompt_sha256": prompt_fingerprint,
+                    "tokenizer_contract_sha256": tokenizer_fingerprint,
+                    "generation_termination_reason": (
+                        harness_limit_reason
+                        or ("assistant_final" if natural_assistant_final else None)
+                    ),
+                    "credit_eligible": (
+                        (is_tool_turn and len(tool_names) == 1)
+                        or (natural_assistant_final and generated_token_count > 0)
+                    ),
+                }
+            )
+            runtime_state["current_assistant_turn_id"] = turn_id
+            if not is_tool_turn:
+                if natural_assistant_final and generated_token_count > 0:
+                    record_non_environment_decision(
+                        runtime_state,
+                        "assistant_final",
+                        {},
+                        runtime_state.get("latest_observation", ""),
+                    )
+                runtime_state["current_assistant_turn_id"] = None
+        return next_state
 
     async def _call_tool(self, tool_call, tools_kwargs, agent_data):
         """把工具适配器拿到的原始 observation 压缩成模型真正可见的版本。
@@ -258,9 +350,15 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             timeout=self.timeout,
             max_steps=self.max_steps,
             required_environment_version=self.required_environment_version,
+            required_environment_manifest_sha256=getattr(
+                self,
+                "environment_manifest_sha256",
+                None,
+            ),
             env_factory=self.env_factory,
         )
         state = await session.start(task_id)
+        state["environment_manifest_sha256"] = getattr(self, "environment_manifest_sha256", None)
         try:
             output = await super().run(sampling_params, **kwargs)
             if not state["done"] and not state["error"]:
@@ -277,10 +375,21 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
             if response_length == 0 or len(set(alignment_lengths.values())) != 1:
                 state["infrastructure_invalid"] = True
                 state["termination_reason"] = "trajectory_alignment_invalid"
-                state["error"] = (
-                    "trajectory_alignment_invalid:"
-                    + ",".join(f"{key}={value}" for key, value in alignment_lengths.items())
+                state["error"] = "trajectory_alignment_invalid:" + ",".join(
+                    f"{key}={value}" for key, value in alignment_lengths.items()
                 )
+            try:
+                turn_spans = materialize_assistant_turn_spans(
+                    state["assistant_turn_records"],
+                    output.response_mask,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                turn_spans = []
+                turn_span_valid = False
+                turn_span_error = f"{exc.__class__.__name__}:{exc}"
+            else:
+                turn_span_valid = True
+                turn_span_error = None
             # 父类结束后统一从环境状态结算，避免把中途异常当作正常终局奖励。
             breakdown = reward_breakdown(state, self.policy_reward)
             output.reward_score = terminal_reward(
@@ -299,6 +408,19 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
                 "action_attempts": int(state["action_attempt_count"]),
                 "repeat_actions": int(state["repeat_action_count"]),
                 "action_trace": list(state["action_events"]),
+                "decision_trace": list(state["decision_events"]),
+                "replay_state_version": REPLAY_STATE_VERSION,
+                "environment_manifest_sha256": state["environment_manifest_sha256"],
+                "environment_version": state.get("environment_version"),
+                "public_query_sha256": state["public_query_sha256"],
+                "initial_public_observation_sha256": state["initial_public_observation_sha256"],
+                "replay_observation_v2_complete": bool(state["replay_observation_v2_complete"]),
+                "replay_contract_error": state["replay_contract_error"],
+                "replay_ledger": list(state["replay_ledger"]),
+                "turn_span_version": TURN_SPAN_VERSION,
+                "turn_span_valid": turn_span_valid,
+                "turn_span_error": turn_span_error,
+                "turn_spans": turn_spans,
                 "reward_mode": self.reward_mode,
                 "policy_reward_version": breakdown["policy_reward_version"],
                 "valid_for_learning": bool(breakdown["valid_for_learning"]),
@@ -317,15 +439,9 @@ class ShoppingToolAgentLoop(ToolAgentLoop):
                 "observation_raw_tokens": int(state["observation_raw_tokens"]),
                 "observation_visible_tokens": int(state["observation_visible_tokens"]),
                 "observation_max_raw_tokens": int(state["observation_max_raw_tokens"]),
-                "observation_max_visible_tokens": int(
-                    state["observation_max_visible_tokens"]
-                ),
-                "observation_visible_asin_count": int(
-                    state["observation_visible_asin_count"]
-                ),
-                "observation_visible_button_count": int(
-                    state["observation_visible_button_count"]
-                ),
+                "observation_max_visible_tokens": int(state["observation_max_visible_tokens"]),
+                "observation_visible_asin_count": int(state["observation_visible_asin_count"]),
+                "observation_visible_button_count": int(state["observation_visible_button_count"]),
                 "observation_any_truncated": bool(state["observation_any_truncated"]),
                 "observation_footer_failures": int(state["observation_footer_failures"]),
                 "guard_rejections": int(state["guard_rejection_count"]),

@@ -39,6 +39,17 @@ def shopping_info(
         "guard_rejections": guards,
         "repeat_actions": repeats,
         "action_trace": [{"tool": "search_products", "accepted": True}],
+        "replay_state_version": "shopping-public-replay-state-v1",
+        "environment_manifest_sha256": "a" * 64,
+        "environment_version": "shopsimulator-environment-v2.1",
+        "public_query_sha256": "b" * 64,
+        "initial_public_observation_sha256": "c" * 64,
+        "replay_observation_v2_complete": True,
+        "replay_ledger": [{"sequence": 0, "tool": "search_products"}],
+        "turn_span_version": "shopping-assistant-turn-spans-v1",
+        "turn_span_valid": True,
+        "turn_span_error": None,
+        "turn_spans": [{"turn_id": 0, "assistant_span": [0, 1]}],
         "reward": {
             "policy_reward_version": "shopping-policy-reward-v1",
             "policy_base": policy_reward,
@@ -184,7 +195,10 @@ class RewardGroupSelectionTest(unittest.TestCase):
             )
             record = json.loads(Path(path).read_text(encoding="utf-8"))
         self.assertEqual(record["global_step"], 1)
+        self.assertEqual(len(record["policy_scope_uid"]), 64)
         self.assertEqual(record["trajectories"][0]["action_trace"][0]["tool"], "search_products")
+        self.assertTrue(record["trajectories"][0]["replay_observation_v2_complete"])
+        self.assertEqual(record["trajectories"][0]["turn_spans"][0]["turn_id"], 0)
         self.assertNotIn("goal", json.dumps(record))
 
 

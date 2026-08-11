@@ -7,11 +7,38 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections.abc import Hashable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+
+def _policy_scope_uid(output_dir: str | Path, global_step: int) -> str:
+    run_dir = Path(output_dir)
+    manifest = next(
+        (
+            candidate
+            for candidate in (
+                run_dir / "run_manifest.json",
+                run_dir / "launch_manifest.json",
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    run_identity = hashlib.sha256(
+        manifest.read_bytes()
+        if manifest is not None
+        else str(run_dir.resolve()).encode("utf-8")
+    ).hexdigest()
+    payload = json.dumps(
+        {"run_identity_sha256": run_identity, "policy_update_id": int(global_step)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def aggregate_shopping_metrics(shopping_infos: Sequence[object]) -> dict[str, float]:
@@ -72,30 +99,21 @@ def aggregate_shopping_metrics(shopping_infos: Sequence[object]) -> dict[str, fl
         max_steps.append(float(info.get("termination_reason") == "max_steps"))
         infrastructure_invalid.append(float(bool(info.get("infrastructure_invalid"))))
         reward_unverifiable.append(float(bool(info.get("reward_unverifiable"))))
-        terminal_utilities.append(
-            float(reward.get("terminal_utility", reward["total"]))
-        )
-        purchase_success.append(
-            float(bool(reward.get("purchase_success", reward["full"])))
-        )
+        terminal_utilities.append(float(reward.get("terminal_utility", reward["total"])))
+        purchase_success.append(float(bool(reward.get("purchase_success", reward["full"]))))
         sampling_invalid.append(
             float(
                 bool(
                     reward.get(
                         "sampling_invalid",
-                        info.get("infrastructure_invalid")
-                        or info.get("reward_unverifiable"),
+                        info.get("infrastructure_invalid") or info.get("reward_unverifiable"),
                     )
                 )
             )
         )
         match_scores.append(float(reward.get("match_score", reward["r_att"])))
-        evidence_coverage.append(
-            float(reward.get("evidence_coverage", 0.0))
-        )
-        partial_purchase.append(
-            float(info.get("reward_type") == "partial_alternative_purchase")
-        )
+        evidence_coverage.append(float(reward.get("evidence_coverage", 0.0)))
+        partial_purchase.append(float(info.get("reward_type") == "partial_alternative_purchase"))
         model_failure.append(float(bool(info.get("model_failure"))))
         valid_for_learning.append(float(bool(info.get("valid_for_learning"))))
         guard_rejections.append(float(info.get("guard_rejections", 0)))
@@ -163,16 +181,14 @@ def extract_shopping_group_signals(
                 f"shopping extra field at index {index} is missing policy or terminal reward"
             ) from exc
         if not math.isfinite(policy_reward) or not math.isfinite(terminal_utility):
-            raise ValueError(
-                f"shopping reward at index {index} is not finite"
-            )
+            raise ValueError(f"shopping reward at index {index} is not finite")
         if info["reward"].get("policy_reward_version") != "shopping-policy-reward-v1":
-            raise ValueError(f"shopping extra field at index {index} has wrong policy reward version")
+            raise ValueError(
+                f"shopping extra field at index {index} has wrong policy reward version"
+            )
         raw_purchase_success = info["reward"].get("purchase_success")
         if not isinstance(raw_purchase_success, (bool, int, float)):
-            raise TypeError(
-                f"shopping extra field at index {index} is missing purchase_success"
-            )
+            raise TypeError(f"shopping extra field at index {index} is missing purchase_success")
         if "infrastructure_invalid" not in info:
             raise ValueError(
                 f"shopping extra field at index {index} is missing infrastructure_invalid"
@@ -182,9 +198,7 @@ def extract_shopping_group_signals(
             reasons.append("infrastructure_invalid")
         if bool(info.get("reward_unverifiable")):
             reasons.append("reward_unverifiable")
-        reward_sampling_invalid = bool(
-            info["reward"].get("sampling_invalid", False)
-        )
+        reward_sampling_invalid = bool(info["reward"].get("sampling_invalid", False))
         if reward_sampling_invalid and not reasons:
             reasons.append(str(info.get("invalid_reason") or "reward_sampling_invalid"))
         expected_valid = not reasons
@@ -250,16 +264,10 @@ def select_reward_varying_groups(
 
     policy_values = policy_rewards if policy_rewards is not None else seq_rewards
     terminal_values = terminal_utilities if terminal_utilities is not None else seq_rewards
-    success_values = (
-        purchase_success if purchase_success is not None else [False] * len(uids)
-    )
-    invalid_values = (
-        sampling_invalid if sampling_invalid is not None else [False] * len(uids)
-    )
+    success_values = purchase_success if purchase_success is not None else [False] * len(uids)
+    invalid_values = sampling_invalid if sampling_invalid is not None else [False] * len(uids)
     reason_values = (
-        sampling_invalid_reasons
-        if sampling_invalid_reasons is not None
-        else [()] * len(uids)
+        sampling_invalid_reasons if sampling_invalid_reasons is not None else [()] * len(uids)
     )
     # uid 是 prompt/task 的组标识；相同 uid 的 K 条 rollout 必须一起作决定。
     grouped: dict[Hashable, dict[str, Any]] = {}
@@ -293,9 +301,7 @@ def select_reward_varying_groups(
             raise ValueError(f"seq_reward at index {index} is not finite: {raw_reward!r}")
         metadata_reward = float(raw_policy_reward)
         if not math.isfinite(metadata_reward):
-            raise ValueError(
-                f"policy_reward at index {index} is not finite: {raw_policy_reward!r}"
-            )
+            raise ValueError(f"policy_reward at index {index} is not finite: {raw_policy_reward!r}")
         # reward_tensor is float32 while Python metadata is serialized as float64.
         # Keep this assertion strict enough to catch trajectory misalignment without
         # treating a single float32 ULP as a different policy reward.
@@ -383,48 +389,31 @@ def select_reward_varying_groups(
         "dropped_group_count": len(dropped_uids),
         "kept_uids": tuple(kept_uids),
         "dropped_uids": tuple(dropped_uids),
-        "all_equal_group_count": sum(
-            not group["reward_varying"] for group in groups
-        ),
+        "all_equal_group_count": sum(not group["reward_varying"] for group in groups),
         "all_zero_reward_group_count": sum(
-            max(abs(value) for value in group["rewards"]) <= tolerance
-            for group in groups
+            max(abs(value) for value in group["rewards"]) <= tolerance for group in groups
         ),
         # The veRL patch used this name before policy/raw rewards were separated.
         "all_zero_utility_group_count": sum(
-            max(abs(value) for value in group["rewards"]) <= tolerance
-            for group in groups
+            max(abs(value) for value in group["rewards"]) <= tolerance for group in groups
         ),
         "all_zero_terminal_utility_group_count": sum(
             max(abs(value) for value in group["terminal_utilities"]) <= tolerance
             for group in groups
         ),
-        "all_purchase_success_group_count": sum(
-            all(group["purchase_success"])
-            for group in groups
-        ),
+        "all_purchase_success_group_count": sum(all(group["purchase_success"]) for group in groups),
         "no_purchase_success_group_count": sum(
             not any(group["purchase_success"]) for group in groups
         ),
-        "sampling_invalid_group_count": sum(
-            group["sampling_invalid"] for group in groups
-        ),
+        "sampling_invalid_group_count": sum(group["sampling_invalid"] for group in groups),
         "sampling_invalid_reason_counts": {
-            reason: sum(
-                reason in group["sampling_invalid_reasons"] for group in groups
-            )
+            reason: sum(reason in group["sampling_invalid_reasons"] for group in groups)
             for reason in sorted(
-                {
-                    reason
-                    for group in groups
-                    for reason in group["sampling_invalid_reasons"]
-                }
+                {reason for group in groups for reason in group["sampling_invalid_reasons"]}
             )
         },
         # Compatibility aliases for existing monitoring code.
-        "infrastructure_invalid_group_count": sum(
-            group["sampling_invalid"] for group in groups
-        ),
+        "infrastructure_invalid_group_count": sum(group["sampling_invalid"] for group in groups),
         "groups": tuple(groups),
     }
     return trajectory_indices, stats
@@ -440,6 +429,7 @@ def append_sampling_audit(
 ) -> Path:
     """Append compact per-group rollout evidence from the central trainer process."""
     destination = Path(output_dir) / "sampling_audit.jsonl"
+    policy_scope_uid = _policy_scope_uid(output_dir, global_step)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("a", encoding="utf-8") as handle:
         for group in group_stats.get("groups", ()):
@@ -464,9 +454,27 @@ def append_sampling_audit(
                         "guard_rejections": info.get("guard_rejections"),
                         "repeat_actions": info.get("repeat_actions"),
                         "action_trace": info.get("action_trace", []),
+                        "decision_trace": info.get("decision_trace", []),
+                        "replay_state_version": info.get("replay_state_version"),
+                        "environment_manifest_sha256": info.get("environment_manifest_sha256"),
+                        "environment_version": info.get("environment_version"),
+                        "public_query_sha256": info.get("public_query_sha256"),
+                        "initial_public_observation_sha256": info.get(
+                            "initial_public_observation_sha256"
+                        ),
+                        "replay_observation_v2_complete": info.get(
+                            "replay_observation_v2_complete"
+                        ),
+                        "replay_contract_error": info.get("replay_contract_error"),
+                        "replay_ledger": info.get("replay_ledger", []),
+                        "turn_span_version": info.get("turn_span_version"),
+                        "turn_span_valid": info.get("turn_span_valid"),
+                        "turn_span_error": info.get("turn_span_error"),
+                        "turn_spans": info.get("turn_spans", []),
                     }
                 )
             record = {
+                "policy_scope_uid": policy_scope_uid,
                 "global_step": int(global_step),
                 "generation_batch": int(generation_batch),
                 "uid": group["uid"],
