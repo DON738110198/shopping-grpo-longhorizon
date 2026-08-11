@@ -34,6 +34,15 @@ from shopping_grpo.training.grpo.adapter.runtime import (
     reward_breakdown,
     validate_policy_reward_config,
 )
+from shopping_grpo.training.grpo.nested_artifacts import (
+    ACTOR_RUN_ATTESTATION_VERSION,
+    build_nested_journal_contract,
+    build_nested_stage1_source_binding,
+    nested_journal_header_sha256,
+    sha256_file,
+    validate_nested_stage1_source_binding,
+    verify_completed_collection_manifest,
+)
 from shopping_grpo.training.grpo.nested_continuation import (
     FORMAL_CONTINUATIONS_PER_DECISION as COLLECTOR_FORMAL_CONTINUATIONS,
 )
@@ -48,8 +57,10 @@ from shopping_grpo.training.grpo.nested_continuation import (
     NESTED_DECISION_VERSION,
     NESTED_EXCLUSION_AUDIT_VERSION,
     NESTED_FOLD_CONTRACT_VERSION,
+    NESTED_FORMAL_PLAN_VERSION,
     NESTED_HARNESS_CONTRACT_VERSION,
     NESTED_ROLLOUT_CONTENT_VERSION,
+    build_nested_formal_plan,
 )
 from shopping_grpo.training.grpo.nested_continuation import (
     NESTED_SEED_SCHEDULE_VERSION as COLLECTOR_SEED_SCHEDULE_VERSION,
@@ -65,10 +76,13 @@ from shopping_grpo.training.grpo.pivotal_states import (
     replay_action_sha256,
     token_ids_sha256,
 )
+from shopping_grpo.training.grpo.stage1_proposal import (
+    verify_first_decision_artifacts,
+)
 
-NESTED_SAMPLES_VERSION = "shopping-psa-nested-samples-v3"
-NESTED_CREDIT_VERSION = "shopping-psa-nested-decision-credit-v3"
-NESTED_ESTIMATOR_VERSION = "shopping-psa-nested-shrinkage-v3"
+NESTED_SAMPLES_VERSION = "shopping-psa-nested-samples-v4"
+NESTED_CREDIT_VERSION = "shopping-psa-nested-decision-credit-v4"
+NESTED_ESTIMATOR_VERSION = "shopping-psa-nested-crn-shrinkage-v4"
 NESTED_HELDOUT_VERSION = "shopping-psa-train4-gate4-v3"
 NESTED_TRAINING_GATE_VERSION = "shopping-psa-nested-training-gate-v3"
 NESTED_SIGNAL_GATE_VERSION = "shopping-psa-nested-signal-gate-v3"
@@ -90,6 +104,7 @@ MIN_TRAINING_TASKS = 32
 MIN_TASK_ESS = 32.0
 ADVANTAGE_CLIP = 0.5
 SHRINKAGE_EPSILON = 1e-8
+CRN_COVARIANCE_DIAGONAL_SHRINKAGE = 0.5
 MIN_HIGH_KAPPA_STATE_RATE = 0.30
 HIGH_KAPPA_THRESHOLD = 0.10
 MIN_HELDOUT_MEAN_DELTA = 0.10
@@ -602,6 +617,57 @@ def _sample_mean_and_variance_of_mean(rewards: Sequence[float]) -> tuple[float, 
     return mean, sample_variance / len(rewards)
 
 
+def _paired_crn_covariance_of_means(
+    reward_rows: Sequence[Sequence[float]],
+) -> tuple[list[float], list[list[float]], list[list[float]]]:
+    """Estimate a PSD covariance of decision means from aligned CRN slots.
+
+    With four train slots, the raw sample covariance is rank limited.  A fixed,
+    preregistered 50% shrink toward its diagonal remains PSD without estimating
+    a reward-dependent shrinkage coefficient from this tiny sample.
+    """
+    if len(reward_rows) < 2:
+        raise ValueError("paired CRN covariance needs at least two decisions")
+    slot_count = len(reward_rows[0])
+    if slot_count < 2 or any(len(row) != slot_count for row in reward_rows):
+        raise ValueError("paired CRN reward rows must have equal slot cardinality")
+    means = [math.fsum(row) / slot_count for row in reward_rows]
+    centered = [
+        [float(value) - mean for value in row]
+        for row, mean in zip(reward_rows, means, strict=True)
+    ]
+    scale = 1.0 / ((slot_count - 1) * slot_count)
+    raw = [
+        [
+            math.fsum(
+                centered[left][slot] * centered[right][slot]
+                for slot in range(slot_count)
+            )
+            * scale
+            for right in range(len(centered))
+        ]
+        for left in range(len(centered))
+    ]
+    shrinkage = CRN_COVARIANCE_DIAGONAL_SHRINKAGE
+    shrunk = [
+        [
+            raw[left][right]
+            if left == right
+            else (1.0 - shrinkage) * raw[left][right]
+            for right in range(len(raw))
+        ]
+        for left in range(len(raw))
+    ]
+    if any(
+        not math.isfinite(value)
+        for matrix in (raw, shrunk)
+        for row in matrix
+        for value in row
+    ):
+        raise ValueError("paired CRN covariance contains a non-finite value")
+    return means, raw, shrunk
+
+
 def _heldout_diagnostic(
     decision_rewards: Sequence[tuple[str, Sequence[float], Sequence[float]]],
 ) -> dict[str, object]:
@@ -894,9 +960,9 @@ def _estimate_nested_decision_credit(
 ) -> dict[str, object]:
     """Estimate nested decision values and outcome-blind training eligibility.
 
-    For decision ``d`` with ``L`` valid continuation rewards, ``q_d`` is their
-    mean and ``u_d`` is the unbiased sample variance divided by ``L``.  The
-    between-decision variance is de-noised by ``sum p_d(1-p_d)u_d``.
+    For decision ``d`` with ``L`` paired continuation rewards, ``q_d`` is their
+    mean.  A fixed diagonal shrinkage is applied to the PSD covariance of the
+    CRN-aligned decision means before de-noising between-decision variance.
     Gate-fold rewards never enter these values or their advantages.
     """
     samples = validate_nested_samples(payload)
@@ -986,6 +1052,7 @@ def _estimate_nested_decision_credit(
         weighted_observed_variance = None
         weighted_uncertainty = None
         between_variance = None
+        paired_crn_covariance = None
         v_s = None
         if eligible:
             eligible_proposal_counts.append(float(proposal_count))
@@ -997,6 +1064,7 @@ def _estimate_nested_decision_credit(
             decision_reward_rows: list[
                 tuple[str, Sequence[float], Sequence[float]]
             ] = []
+            train_reward_rows: list[list[float]] = []
             for decision in decisions:
                 decision_uid = decision["decision_uid"]
                 train_rewards = [
@@ -1009,6 +1077,7 @@ def _estimate_nested_decision_credit(
                     for continuation in decision["continuations"]
                     if continuation["continuation_index"] in GATE_FOLD_INDICES
                 ]
+                train_reward_rows.append(train_rewards)
                 q_d, u_d = _sample_mean_and_variance_of_mean(train_rewards)
                 c_d = multiplicities[decision_uid]
                 value_rows.append(
@@ -1025,6 +1094,18 @@ def _estimate_nested_decision_credit(
                 )
                 decision_reward_rows.append((decision_uid, train_rewards, gate_rewards))
 
+            crn_means, raw_covariance, shrunk_covariance = (
+                _paired_crn_covariance_of_means(train_reward_rows)
+            )
+            if any(
+                abs(float(row["q_d"]) - crn_mean) > 1e-12
+                for row, crn_mean in zip(value_rows, crn_means, strict=True)
+            ):
+                raise AssertionError("paired CRN means differ from decision values")
+            for index, row in enumerate(value_rows):
+                if abs(float(row["u_d"]) - shrunk_covariance[index][index]) > 1e-12:
+                    raise AssertionError("paired CRN covariance diagonal mismatch")
+
             mu_s = math.fsum(
                 row["proposal_multiplicity"] * row["q_d"] for row in value_rows
             ) / proposal_count
@@ -1032,17 +1113,56 @@ def _estimate_nested_decision_credit(
                 row["proposal_multiplicity"] * (row["q_d"] - mu_s) ** 2
                 for row in value_rows
             ) / proposal_count
-            weighted_uncertainty = math.fsum(
-                (row["proposal_multiplicity"] / proposal_count)
-                * (1.0 - row["proposal_multiplicity"] / proposal_count)
-                * row["u_d"]
+            proposal_weights = [
+                float(row["proposal_multiplicity"]) / proposal_count
                 for row in value_rows
-            )
-            between_variance = max(weighted_observed_variance - weighted_uncertainty, 0.0)
-            for row in value_rows:
-                kappa_d = between_variance / (
-                    between_variance + row["u_d"] + SHRINKAGE_EPSILON
+            ]
+            covariance_times_weight = [
+                math.fsum(
+                    shrunk_covariance[left][right] * proposal_weights[right]
+                    for right in range(len(value_rows))
                 )
+                for left in range(len(value_rows))
+            ]
+            weighted_mean_noise = math.fsum(
+                proposal_weights[index] * covariance_times_weight[index]
+                for index in range(len(value_rows))
+            )
+            weighted_uncertainty = math.fsum(
+                proposal_weights[index] * shrunk_covariance[index][index]
+                for index in range(len(value_rows))
+            ) - weighted_mean_noise
+            if weighted_uncertainty < -1e-12:
+                raise AssertionError("paired CRN weighted uncertainty is not PSD")
+            weighted_uncertainty = max(weighted_uncertainty, 0.0)
+            paired_crn_covariance = {
+                "slot_indices": list(TRAIN_FOLD_INDICES),
+                "slot_alignment_verified": True,
+                "full_decision_slot_cartesian_product_verified": True,
+                "seed_schedule_version": NESTED_SEED_SCHEDULE_VERSION,
+                "decision_uids": [row["decision_uid"] for row in value_rows],
+                "raw_covariance_of_means": raw_covariance,
+                "diagonal_shrinkage": CRN_COVARIANCE_DIAGONAL_SHRINKAGE,
+                "shrunk_covariance_of_means": shrunk_covariance,
+                "psd_by_convex_construction": True,
+                "weighted_mean_noise_variance": weighted_mean_noise,
+            }
+            between_variance = max(weighted_observed_variance - weighted_uncertainty, 0.0)
+            for index, row in enumerate(value_rows):
+                contrast_noise_variance = (
+                    shrunk_covariance[index][index]
+                    + weighted_mean_noise
+                    - 2.0 * covariance_times_weight[index]
+                )
+                if contrast_noise_variance < -1e-12:
+                    raise AssertionError("paired CRN contrast variance is not PSD")
+                contrast_noise_variance = max(contrast_noise_variance, 0.0)
+                kappa_d = between_variance / (
+                    between_variance
+                    + contrast_noise_variance
+                    + SHRINKAGE_EPSILON
+                )
+                row["contrast_noise_variance"] = contrast_noise_variance
                 row["kappa_d"] = kappa_d
                 row["q_tilde_d"] = mu_s + kappa_d * (row["q_d"] - mu_s)
             if max(float(row["kappa_d"]) for row in value_rows) > HIGH_KAPPA_THRESHOLD:
@@ -1095,6 +1215,7 @@ def _estimate_nested_decision_credit(
                 "weighted_observed_variance": weighted_observed_variance,
                 "weighted_uncertainty": weighted_uncertainty,
                 "between_variance": between_variance,
+                "paired_crn_covariance": paired_crn_covariance,
                 "v_s": v_s,
                 "advantage_scale": advantage_scale if eligible else None,
                 "decision_values": decision_values,
@@ -1162,8 +1283,15 @@ def _estimate_nested_decision_credit(
             "mu_s_weight": "proposal multiplicity",
             "q_and_u_source": "train fold only (indices 0..3)",
             "gate_reward_role": "signal gate only; never refit into q or advantage",
-            "between_variance": "max(weighted_var(q_d)-sum(p_d*(1-p_d)*u_d),0)",
-            "kappa_d": "between/(between+u_d+epsilon)",
+            "crn_slot_contract": "complete decision x train-slot Cartesian product",
+            "crn_covariance": "sample covariance of paired decision means",
+            "covariance_shrinkage": (
+                "fixed 0.5 convex shrink toward diagonal; PSD by construction"
+            ),
+            "between_variance": (
+                "max(weighted_var(q_d)-trace(diag(p)Sigma)+p^T Sigma p,0)"
+            ),
+            "kappa_d": "between/(between+Var(q_d-weighted_mean)+epsilon)",
             "q_tilde_d": "mu_s+kappa_d*(q_d-mu_s)",
             "v_s_weight": "proposal multiplicity",
             "advantage": "common_scale(q_tilde_d-v_s,max_abs=0.5)",
@@ -1288,7 +1416,10 @@ def _read_bound_collection_artifacts(
         raw_path = artifact_files.get(name)
         if not isinstance(raw_path, (str, Path)):
             raise TypeError(f"{name} artifact path must be path-like")
-        path = Path(raw_path).expanduser().resolve()
+        requested_path = Path(raw_path).expanduser().absolute()
+        if requested_path.is_symlink():
+            raise ValueError("nested artifact paths must not be symbolic links")
+        path = requested_path.resolve()
         if not path.is_file() or path in resolved_paths:
             raise ValueError("nested artifact paths must be distinct existing files")
         resolved_paths.add(path)
@@ -1536,6 +1667,7 @@ def _validate_source_proposal(
     source: Mapping[str, object],
     *,
     state_uid: str,
+    active_group_uid: str,
     decision: Mapping[str, object],
     group: Mapping[str, object],
     stage1_by_source: Mapping[tuple[str, int], Mapping[str, object]],
@@ -1543,6 +1675,7 @@ def _validate_source_proposal(
     expected_fields = {
         "proposal_index",
         "proposal_uid",
+        "stage1_proposal_uid",
         "source_uid",
         "stage1_suffix_uid",
         "stage1_suffix_index",
@@ -1571,7 +1704,10 @@ def _validate_source_proposal(
     suffix = suffixes[proposal_index]
     if source.get("stage1_suffix_uid") != suffix.get("suffix_uid"):
         raise ValueError("nested source proposal suffix_uid mismatch")
-    stage1 = stage1_by_source.get((state_uid, proposal_index))
+    expected_stage1_proposal_uid = proposal_uid(active_group_uid, proposal_index)
+    if source.get("stage1_proposal_uid") != expected_stage1_proposal_uid:
+        raise ValueError("nested stage-one proposal_uid mismatch")
+    stage1 = stage1_by_source.get((active_group_uid, proposal_index))
     if stage1 is None:
         raise ValueError("nested source proposal has no stage-one record")
     stage1_record_sha = _sha256_json(dict(stage1))
@@ -1602,7 +1738,7 @@ def _validate_source_proposal(
     ):
         raise ValueError("nested source old-logprob hash mismatch")
     if (
-        stage1.get("active_group_uid") != state_uid
+        stage1.get("active_group_uid") != active_group_uid
         or stage1.get("suffix_index") != proposal_index
         or stage1.get("suffix_uid") != suffix["suffix_uid"]
         or stage1.get("prompt_token_sha256") != prompt_hash
@@ -1630,13 +1766,17 @@ def estimate_nested_collection_credit(
     *,
     actor_checkpoint: str | Path,
     environment_manifest: Mapping[str, object],
+    environment_manifest_path: str | Path,
     environment_manifest_sha256: str,
     active_branch_plan: Mapping[str, object],
     resolved_selections: Sequence[Mapping[str, object]],
     stage1_records: Sequence[Mapping[str, object]],
     stage1_source_sha256: str,
+    stage1_records_path: str | Path,
+    stage1_manifest: str | Path,
     sampling_backend_contract: Mapping[str, object],
     artifact_files: Mapping[str, object],
+    collection_manifest: str | Path,
     policy_reward: object = None,
 ) -> dict[str, object]:
     """Attest collector artifacts, then estimate credit without unlocking early.
@@ -1661,9 +1801,30 @@ def estimate_nested_collection_credit(
     summary = collection.get("summary")
     if not isinstance(summary, Mapping):
         raise TypeError("nested collection summary must be an object")
+    completed_snapshot = verify_completed_collection_manifest(
+        collection_manifest,
+        artifact_files=artifact_files,
+        include_file_attestation=True,
+    )
+    completed_manifest = completed_snapshot["manifest"]
+    completed_manifest_file_sha256 = str(
+        completed_snapshot["manifest_file_sha256"]
+    )
     normalized_file_hashes = _read_bound_collection_artifacts(
         artifact_files, collection
     )
+    manifest_artifacts = completed_manifest.get("artifacts")
+    if (
+        not isinstance(manifest_artifacts, Mapping)
+        or any(
+            normalized_file_hashes[name]
+            != (manifest_artifacts.get(name) or {}).get("sha256")
+            for name in normalized_file_hashes
+        )
+    ):
+        raise ValueError(
+            "nested artifact snapshot changed after manifest verification"
+        )
     if summary.get("schema_version") != NESTED_COLLECTION_VERSION:
         raise ValueError("nested collection summary version mismatch")
     exclusion_audit = summary.get("exclusion_audit")
@@ -1728,11 +1889,50 @@ def estimate_nested_collection_credit(
     stage1_source_sha = _required_sha256(stage1_source_sha256, "stage1_source_sha256")
     if summary.get("stage1_source_sha256") != stage1_source_sha:
         raise ValueError("nested collection stage-one source SHA256 mismatch")
+    stage1_records_file = Path(stage1_records_path).expanduser().resolve()
+    stage1_manifest_file = Path(stage1_manifest).expanduser().resolve()
+    verified_stage1 = verify_first_decision_artifacts(
+        plan=normalized_plan,
+        records_path=stage1_records_file,
+        manifest_path=stage1_manifest_file,
+    )
+    if _canonical_json(list(stage1_records)) != _canonical_json(
+        verified_stage1["records"]
+    ):
+        raise ValueError("Stage-1 records differ from their completion manifest")
+    if (
+        hashlib.sha256(stage1_records_file.read_bytes()).hexdigest()
+        != stage1_source_sha
+    ):
+        raise ValueError("Stage-1 source bytes differ from the supplied digest")
+    stage1_binding = build_nested_stage1_source_binding(
+        verified_stage1["manifest"],
+        final_manifest_sha256=str(verified_stage1["manifest_file_sha256"]),
+    )
+    summary_stage1_binding = validate_nested_stage1_source_binding(
+        provenance.get("stage1_source_binding"),
+        expected_records_sha256=stage1_source_sha,
+    )
+    if stage1_binding != summary_stage1_binding:
+        raise ValueError("nested collection Stage-1 completion binding mismatch")
 
-    manifest = validate_manifest(deepcopy(dict(environment_manifest)))
+    manifest_file = Path(environment_manifest_path).expanduser().resolve()
+    try:
+        manifest_from_file = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("environment manifest file is invalid") from exc
+    if (
+        not isinstance(manifest_from_file, Mapping)
+        or _canonical_json(dict(environment_manifest))
+        != _canonical_json(dict(manifest_from_file))
+    ):
+        raise ValueError("environment manifest object differs from its source file")
+    manifest = validate_manifest(deepcopy(dict(manifest_from_file)))
     manifest_sha = _required_sha256(
         environment_manifest_sha256, "environment_manifest_sha256"
     )
+    if sha256_file(manifest_file) != manifest_sha:
+        raise ValueError("environment manifest file SHA256 mismatch")
     environment_version = str(
         manifest.get("environment_version", "shopsimulator-environment-v2.1")
     )
@@ -1774,6 +1974,46 @@ def estimate_nested_collection_credit(
     harness_sha = _sha256_json(dict(harness))
     if summary.get("harness_contract_sha256") != harness_sha:
         raise ValueError("nested collection harness SHA256 mismatch")
+    if (
+        stage1_binding["active_plan_sha256"] != plan_sha
+        or stage1_binding["policy_reward_sha256"] != policy_reward_sha
+        or stage1_binding["harness_contract_sha256"] != harness_sha
+        or stage1_binding["required_environment_version"]
+        != environment_version
+        or stage1_binding["environment_manifest_sha256s"] != [manifest_sha]
+    ):
+        raise ValueError("finalized Stage-1 contract differs from nested runtime")
+    formal_plan = build_nested_formal_plan(
+        normalized_plan,
+        list(resolved_selections),
+        required_environment_version=environment_version,
+        policy_reward_sha256=policy_reward_sha,
+        harness_contract_sha256=harness_sha,
+        sampling_backend_contract_sha256=backend_sha,
+    )
+    formal_plan_sha = _sha256_json(formal_plan)
+    if (
+        formal_plan.get("schema_version") != NESTED_FORMAL_PLAN_VERSION
+        or summary.get("formal_plan") != formal_plan
+        or summary.get("formal_plan_sha256") != formal_plan_sha
+    ):
+        raise ValueError("nested formal plan v2 identity mismatch")
+    expected_experiment_uid = _sha256_json(
+        {
+            "formal_plan_sha256": formal_plan_sha,
+            "stage1_source_sha256": stage1_source_sha,
+            "stage1_manifest_sha256": stage1_binding[
+                "final_manifest_sha256"
+            ],
+            "harness_contract_sha256": harness_sha,
+            "continuations_per_decision": (summary.get("aggregate") or {}).get(
+                "continuations_per_decision"
+            ),
+            "fold_contract_version": NESTED_FOLD_CONTRACT_VERSION,
+        }
+    )
+    if summary.get("experiment_uid") != expected_experiment_uid:
+        raise ValueError("nested formal experiment UID mismatch")
 
     fold = summary.get("fold_contract")
     if not isinstance(fold, Mapping) or fold != {
@@ -1800,6 +2040,15 @@ def estimate_nested_collection_credit(
         or safety.get("outcome_conditioned_resampling") is not False
         or safety.get("fresh_lease_per_continuation") is not True
         or safety.get("common_random_numbers_by_state_slot") is not True
+        or safety.get("streaming_journal_and_resume") is not True
+        or safety.get("manifest_commit_required") is not True
+        or safety.get("actor_start_end_full_hash") is not True
+        or safety.get("actor_runtime_stat_binding") is not True
+        or safety.get("actor_prehashed_backend_binding") is not True
+        or safety.get("actor_stat_checked_before_every_completion") is not True
+        or safety.get("finalized_stage1_source") is not True
+        or safety.get("scale_collection_ready") is not True
+        or safety.get("formal_scale_blockers") != []
     ):
         raise ValueError("nested collector safety lock is invalid")
 
@@ -1816,19 +2065,28 @@ def estimate_nested_collection_credit(
             raise ValueError("stage-one source repeats one proposal slot")
         stage1_by_source[key] = record
 
-    groups = {
+    active_groups = {
         group["active_group_uid"]: group for group in normalized_plan["groups"]
+    }
+    groups = {
+        formal_group["formal_group_uid"]: {
+            "formal": formal_group,
+            "active": active_groups[formal_group["source_active_group_uid"]],
+        }
+        for formal_group in formal_plan["groups"]
     }
     recomputed_stage1_structure = classify_nested_stage1_structure(
         normalized_plan, stage1_records
     )
+    if recomputed_stage1_structure != verified_stage1["structure"]:
+        raise ValueError("Stage-1 structural partition differs from its final manifest")
     if dict(exclusion_audit) != recomputed_stage1_structure["exclusion_audit"]:
         raise ValueError(
             "nested exclusion audit differs from outcome-blind stage-one recomputation"
         )
     expected_stage1_slots = {
         (state_uid, proposal_index)
-        for state_uid, group in groups.items()
+        for state_uid, group in active_groups.items()
         for proposal_index in range(len(group["suffixes"]))
     }
     if set(stage1_by_source) != expected_stage1_slots:
@@ -1844,6 +2102,8 @@ def estimate_nested_collection_credit(
     seen_decision_uids: set[str] = set()
     seen_continuation_uids: set[str] = set()
     seen_lease_sequences: set[int] = set()
+    eligible_stage1_proposal_uids: set[str] = set()
+    eligible_active_group_uids: set[str] = set()
     computed_valid_decisions = 0
     computed_credit_eligible_decisions = 0
     duplicate_semantic_rollout_count = 0
@@ -1859,11 +2119,16 @@ def estimate_nested_collection_credit(
         ):
             raise ValueError("nested decision safety lock is invalid")
         state_uid = _required_sha256(raw_decision.get("state_uid"), "state_uid")
-        if raw_decision.get("active_group_uid") != state_uid:
-            raise ValueError("nested decision state and active group differ")
-        group = groups.get(state_uid)
-        if group is None:
-            raise ValueError("nested decision state is not in the active plan")
+        group_bundle = groups.get(state_uid)
+        if group_bundle is None:
+            raise ValueError("nested decision state is not in formal plan v2")
+        formal_group = group_bundle["formal"]
+        group = group_bundle["active"]
+        active_group_uid = _required_sha256(
+            raw_decision.get("active_group_uid"), "active_group_uid"
+        )
+        if active_group_uid != formal_group["source_active_group_uid"]:
+            raise ValueError("nested decision active/formal group binding differs")
         task_id = raw_decision.get("task_id")
         if (
             not isinstance(task_id, int)
@@ -1942,7 +2207,9 @@ def estimate_nested_collection_credit(
         identity = raw_decision.get("identity")
         expected_identity = {
             "decision_identity": decision_identity,
-            "active_group_uid": state_uid,
+            "formal_plan_version": NESTED_FORMAL_PLAN_VERSION,
+            "formal_plan_sha256": formal_plan_sha,
+            "active_group_uid": active_group_uid,
             "parent_branch_uid": group["parent_branch_uid"],
             "replay_state_id": group["replay_state_id"],
             "task_id": task_id,
@@ -1957,6 +2224,9 @@ def estimate_nested_collection_credit(
                 "active_branch_plan_sha256": plan_sha,
                 "resolved_selections_sha256": resolved_sha,
                 "stage1_source_sha256": stage1_source_sha,
+                "stage1_manifest_sha256": stage1_binding[
+                    "final_manifest_sha256"
+                ],
             },
         }
         if identity != expected_identity or group["environment_manifest_sha256"] != manifest_sha:
@@ -1969,6 +2239,7 @@ def estimate_nested_collection_credit(
             _validate_source_proposal(
                 source,
                 state_uid=state_uid,
+                active_group_uid=active_group_uid,
                 decision=raw_decision,
                 group=group,
                 stage1_by_source=stage1_by_source,
@@ -1978,6 +2249,10 @@ def estimate_nested_collection_credit(
         ]
         if len(normalized_proposals) != len(raw_sources) or not normalized_proposals:
             raise TypeError("nested source proposals must be non-empty objects")
+        eligible_stage1_proposal_uids.update(
+            str(source["stage1_proposal_uid"]) for source in raw_sources
+        )
+        eligible_active_group_uids.add(active_group_uid)
         normalized_proposals.sort(key=lambda item: item["proposal_index"])
         proposal_uids = [item["proposal_uid"] for item in normalized_proposals]
         if (
@@ -2326,14 +2601,17 @@ def estimate_nested_collection_credit(
         raise ValueError("nested collection repeats proposal identities")
 
     pre_registered_by_state = {
-        state_uid: [proposal_uid(state_uid, index) for index in range(len(group["suffixes"]))]
-        for state_uid, group in groups.items()
+        active_group_uid: [
+            proposal_uid(active_group_uid, index)
+            for index in range(len(group["suffixes"]))
+        ]
+        for active_group_uid, group in active_groups.items()
     }
     pre_registered_uids = {
         uid for proposal_uids in pre_registered_by_state.values() for uid in proposal_uids
     }
-    eligible_uids = set(all_proposal_uids)
-    eligible_state_uids = {state["state_uid"] for state in normalized_state_rows}
+    eligible_uids = eligible_stage1_proposal_uids
+    eligible_state_uids = eligible_active_group_uids
     excluded_records = _require_sequence(
         exclusion_audit.get("excluded_state_records"),
         "nested excluded state records",
@@ -2359,7 +2637,7 @@ def estimate_nested_collection_credit(
         state_uid = _required_sha256(
             excluded_record.get("state_uid"), "excluded state_uid"
         )
-        group = groups.get(state_uid)
+        group = active_groups.get(state_uid)
         if group is None or state_uid in excluded_state_uids:
             raise ValueError("nested exclusion audit has an unknown or repeated state")
         excluded_state_uids.add(state_uid)
@@ -2421,10 +2699,10 @@ def estimate_nested_collection_credit(
     )
     if (
         eligible_state_uids.intersection(excluded_state_uids)
-        or eligible_state_uids.union(excluded_state_uids) != set(groups)
+            or eligible_state_uids.union(excluded_state_uids) != set(active_groups)
         or eligible_uids.intersection(excluded_uids)
         or eligible_uids.union(excluded_uids) != pre_registered_uids
-        or exclusion_audit.get("pre_registered_states") != len(groups)
+            or exclusion_audit.get("pre_registered_states") != len(active_groups)
         or exclusion_audit.get("pre_registered_proposals") != len(pre_registered_uids)
         or exclusion_audit.get("eligible_states") != len(eligible_state_uids)
         or exclusion_audit.get("eligible_proposals") != len(eligible_uids)
@@ -2524,7 +2802,41 @@ def estimate_nested_collection_credit(
     ):
         raise ValueError("nested collection aggregate gate mismatch")
 
+    actor_run_attestation = completed_manifest["actor_run_attestation"]
+    actor_runtime_binding = {
+        "schema_version": ACTOR_RUN_ATTESTATION_VERSION,
+        "actor_checkpoint_sha256": actor_sha,
+        "stat_snapshot_sha256": actor_run_attestation["stat_snapshot_sha256"],
+        "stat_entry_count": actor_run_attestation["stat_entry_count"],
+        "read_only_run_binding": True,
+    }
+    expected_journal_contract = build_nested_journal_contract(
+        experiment_uid=str(summary["experiment_uid"]),
+        active_plan_sha256=plan_sha,
+        formal_plan_sha256=formal_plan_sha,
+        resolved_selections_sha256=resolved_sha,
+        stage1_source_sha256=stage1_source_sha,
+        stage1_manifest_sha256=stage1_binding["final_manifest_sha256"],
+        stage1_source_finalized=True,
+        harness_contract_sha256=harness_sha,
+        actor_runtime_binding=actor_runtime_binding,
+        continuations_per_decision=int(collected_count),
+        expected_continuation_uids=[
+            str(continuation_uid_value)
+            for decision in decisions
+            for continuation_uid_value in decision["continuation_uids"]
+        ],
+    )
+    journal_completion = completed_manifest["journal_completion"]
+    if journal_completion.get("header_sha256") != nested_journal_header_sha256(
+        expected_journal_contract
+    ):
+        raise ValueError("nested journal header is not bound to the formal collection")
+
     source_contract = {
+        "collection_manifest_sha256": completed_manifest_file_sha256,
+        "artifact_set_uid": completed_manifest["artifact_set_uid"],
+        "journal_header_sha256": journal_completion["header_sha256"],
         "artifact_file_sha256s": normalized_file_hashes,
         "canonical_artifact_sha256s": {
             "decisions": _sha256_json(list(decisions)),
@@ -2535,8 +2847,12 @@ def estimate_nested_collection_credit(
         "environment_manifest_sha256": manifest_sha,
         "environment_version": environment_version,
         "active_branch_plan_sha256": plan_sha,
+        "nested_formal_plan_version": NESTED_FORMAL_PLAN_VERSION,
+        "nested_formal_plan_sha256": formal_plan_sha,
         "resolved_selections_sha256": resolved_sha,
         "stage1_source_sha256": stage1_source_sha,
+        "stage1_manifest_sha256": stage1_binding["final_manifest_sha256"],
+        "stage1_source_binding_sha256": _sha256_json(stage1_binding),
         "policy_reward_sha256": policy_reward_sha,
         "decoding_config_sha256": decoding_sha,
         "sampling_backend_contract_sha256": backend_sha,

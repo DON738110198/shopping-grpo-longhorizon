@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -28,6 +29,7 @@ from shopping_grpo.training.grpo.active_suffix import (
     ActiveSuffixRunner,
     VllmTokenCompletionClient,
     _normalize_tool_calls,
+    _sha256_json,
     append_assistant_turn,
     append_tool_observation,
     attest_actor_checkpoint,
@@ -37,6 +39,12 @@ from shopping_grpo.training.grpo.active_suffix import (
     sha256_actor_checkpoint,
     summarize_active_suffix_group,
     tool_schema_sha256,
+)
+from shopping_grpo.training.grpo.nested_artifacts import (
+    NESTED_REQUEST_INTENT_VERSION,
+    ActorCheckpointRunAttestation,
+    NestedContinuationJournal,
+    finalize_scale_ready_collection,
 )
 from shopping_grpo.training.grpo.nested_continuation import (
     NESTED_COLLECTION_VERSION,
@@ -53,10 +61,28 @@ from shopping_grpo.training.grpo.pivotal_states import (
     replay_state_id,
     token_ids_sha256,
 )
+from shopping_grpo.training.grpo.stage1_proposal import (
+    FirstDecisionStage1Collector,
+    write_first_decision_artifacts,
+)
 
 PRODUCT_ID = "123456789012"
 TOKENIZER_SHA256 = "b" * 64
-MANIFEST_SHA256 = "a" * 64
+MANIFEST_SHA256 = hashlib.sha256(
+    (Path(__file__).resolve().parents[1] / "data" / "environment.json").read_bytes()
+).hexdigest()
+
+
+def _in_memory_completion_intent(intent):
+    persisted = {
+        "schema_version": NESTED_REQUEST_INTENT_VERSION,
+        "intent_uid": _sha256_json(
+            {"schema_version": NESTED_REQUEST_INTENT_VERSION, **intent}
+        ),
+        **copy.deepcopy(intent),
+    }
+    persisted["intent_sha256"] = _sha256_json(persisted)
+    return persisted
 
 
 def observation_state(page_type="search_home"):
@@ -139,13 +165,14 @@ def reward_detail():
     }
 
 
-def decoding_and_backend(actor_sha256):
+def decoding_and_backend(actor_sha256, **overrides):
     template = (
         Path(__file__).resolve().parents[1]
         / "configs"
         / "active_suffix_decoding_template.json"
     )
     decoding = json.loads(template.read_text(encoding="utf-8"))
+    decoding.update(overrides)
     decoding["tool_schema_sha256"] = tool_schema_sha256(SHOP_TOOL_SCHEMAS)
     backend = build_sampling_backend_contract(
         server_version="0.25.1",
@@ -480,6 +507,8 @@ class FakeParser:
                 {"name": "open_product", "arguments": {"asin": PRODUCT_ID}},
                 {"name": "think", "arguments": {"reason": "inspect"}},
             ]
+        if token_ids == [49]:
+            return [{"name": "unknown_tool", "arguments": None}]
         return []
 
 
@@ -496,6 +525,10 @@ class FakePlanBoundClient:
         self.attestations += 1
         self.attestation = kwargs
         return self
+
+    def attest_and_bind_prehashed(self, *, actor_runtime_binding, **kwargs):
+        self.actor_runtime_binding = actor_runtime_binding
+        return self.attest_and_bind(**kwargs)
 
     def complete(self, prompt_token_ids, *, seed):
         self.calls += 1
@@ -713,6 +746,8 @@ class ActiveSuffixPrimitiveTest(unittest.TestCase):
                 "audit.jsonl",
                 "--active-suffixes",
                 "suffixes.jsonl",
+                "--stage1-manifest",
+                "stage1-manifest.json",
                 "--actor-checkpoint",
                 "actor",
                 "--sampling-backend-contract",
@@ -729,6 +764,21 @@ class ActiveSuffixPrimitiveTest(unittest.TestCase):
         )
         self.assertIsNone(args.expected_proposals)
         self.assertEqual(args.continuations_per_decision, 8)
+
+    def test_nested_formal_git_gate_rejects_dirty_live_worktree(self):
+        git_sha = "c" * 40
+        with (
+            patch.object(
+                nested_cli.subprocess,
+                "run",
+                side_effect=[
+                    SimpleNamespace(stdout=f"{git_sha}\n"),
+                    SimpleNamespace(stdout=" M dirty.py\n"),
+                ],
+            ),
+            self.assertRaisesRegex(ValueError, "requires the clean"),
+        ):
+            nested_cli._require_clean_git_head(git_sha)
 
     def test_collection_cli_writes_invalid_artifacts_then_exits_nonzero(self):
         collection = {
@@ -768,7 +818,27 @@ class ActiveSuffixPrimitiveTest(unittest.TestCase):
 
         async def fake_run(args):
             del args
-            return collection
+            return {
+                "collection": collection,
+                "journal_report": {},
+                "actor_attestation": {},
+                "journal_path": Path("journal"),
+            }
+
+        def fake_commit(collection, *, artifact_files, manifest_path, **kwargs):
+            del kwargs
+            artifact_files["decisions"].write_text(
+                json.dumps(collection["decisions"][0]) + "\n", encoding="utf-8"
+            )
+            artifact_files["continuations"].write_text(
+                json.dumps(collection["continuations"][0]) + "\n",
+                encoding="utf-8",
+            )
+            artifact_files["summary"].write_text(
+                json.dumps(collection["summary"]) + "\n", encoding="utf-8"
+            )
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            return {"artifact_set_uid": "b" * 64}
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -776,10 +846,17 @@ class ActiveSuffixPrimitiveTest(unittest.TestCase):
                 decisions_output=root / "decisions.jsonl",
                 continuations_output=root / "continuations.jsonl",
                 summary_output=root / "summary.json",
+                journal_dir=None,
+                manifest_output=root / "collection-manifest.json",
             )
             with (
                 patch.object(nested_cli, "parse_args", return_value=args),
                 patch.object(nested_cli, "_run", new=fake_run),
+                patch.object(
+                    nested_cli,
+                    "commit_nested_collection_artifacts",
+                    new=fake_commit,
+                ),
                 self.assertRaises(SystemExit) as raised,
             ):
                 nested_cli.main()
@@ -787,6 +864,7 @@ class ActiveSuffixPrimitiveTest(unittest.TestCase):
             self.assertTrue(args.decisions_output.is_file())
             self.assertTrue(args.continuations_output.is_file())
             self.assertTrue(args.summary_output.is_file())
+            self.assertTrue(args.manifest_output.is_file())
 
     def test_materializer_cli_defaults_to_repository_template(self):
         args = parse_materialize_args(
@@ -910,6 +988,55 @@ class ActiveSuffixPrimitiveTest(unittest.TestCase):
             )
             self.assertEqual(completion["token_ids"], [41, 42])
             self.assertEqual(completion["old_logprobs"], [-0.1, -0.2])
+
+    def test_vllm_prehashed_binding_does_not_rehash_actor_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            actor = Path(tmp)
+            (actor / "weights.bin").write_bytes(b"weights")
+            actor_sha = sha256_actor_checkpoint(actor)
+            decoding, backend = decoding_and_backend(actor_sha)
+
+            def metadata(url, headers, timeout):
+                del headers, timeout
+                if url.endswith("/version"):
+                    return {"version": "0.25.1"}
+                return {
+                    "data": [
+                        {
+                            "id": "shopping-agent",
+                            "root": str(actor.resolve()),
+                            "max_model_len": decoding["context_window"],
+                        }
+                    ]
+                }
+
+            client = VllmTokenCompletionClient(
+                "shopping-agent",
+                "http://127.0.0.1:8000/v1",
+                "EMPTY",
+                metadata_transport=metadata,
+            )
+            with patch(
+                "shopping_grpo.training.grpo.active_suffix.sha256_actor_checkpoint",
+                side_effect=AssertionError("actor tree was rehashed"),
+            ):
+                bound = client.attest_and_bind_prehashed(
+                    plan_sha256="1" * 64,
+                    expected_contract=backend,
+                    expected_contract_sha256=sampling_backend_contract_sha256(
+                        backend
+                    ),
+                    decoding_config=decoding,
+                    actor_checkpoint=actor,
+                    actor_checkpoint_sha256=actor_sha,
+                    actor_runtime_binding={
+                        "actor_checkpoint_sha256": actor_sha,
+                        "stat_snapshot_sha256": "2" * 64,
+                        "read_only_run_binding": True,
+                    },
+                )
+
+        self.assertIsNotNone(bound)
 
     def test_repository_template_materializes_from_live_backend_metadata(self):
         repo = Path(__file__).resolve().parents[1]
@@ -1455,13 +1582,24 @@ class NestedContinuationCollectorTest(unittest.TestCase):
         state_count=1,
         long_prompt=False,
         env_factory=FakeEnvironment,
+        nested_client=None,
+        stage1_client=None,
+        use_actor_attestor=False,
+        formal_stage1=False,
+        stage1_clean=True,
+        resolved_factory=resolved_branch,
+        decoding_overrides=None,
     ):
-        actor = Path(root)
+        artifact_root = Path(root)
+        actor = artifact_root / "actor" if formal_stage1 else artifact_root
+        actor.mkdir(exist_ok=True)
         (actor / "weights.bin").write_bytes(b"weights")
         actor_sha = sha256_actor_checkpoint(actor)
-        decoding, backend = decoding_and_backend(actor_sha)
+        decoding, backend = decoding_and_backend(
+            actor_sha, **(decoding_overrides or {})
+        )
         resolved = [
-            resolved_branch(
+            resolved_factory(
                 17 + index,
                 ([10 + index] * 23551)
                 if long_prompt
@@ -1476,38 +1614,339 @@ class NestedContinuationCollectorTest(unittest.TestCase):
             seed=20260811,
             suffixes_per_state=2,
         )
-        stage1 = asyncio.run(
-            ActiveSuffixRunner(
-                plan=plan,
-                resolved_selections=resolved,
-                actor_checkpoint=actor,
-                sampling_backend_contract=backend,
-                completion_client=FakePlanBoundClient(),
-                parser=FakeParser(),
-                encoder=FakeEncoder(),
-                env_factory=FakeEnvironment,
-                expected_groups=state_count,
-                expected_suffixes_per_state=2,
-            ).collect()
-        )["records"]
+        if formal_stage1:
+            stage1_collection = asyncio.run(
+                FirstDecisionStage1Collector(
+                    plan=plan,
+                    resolved_selections=resolved,
+                    actor_checkpoint=actor,
+                    actor_tokenizer_contract_sha256=TOKENIZER_SHA256,
+                    sampling_backend_contract=backend,
+                    completion_client=stage1_client or FakePlanBoundClient(),
+                    parser=FakeParser(),
+                    tool_schemas=SHOP_TOOL_SCHEMAS,
+                    required_environment_version="shopsimulator-environment-v2.1",
+                    expected_states=state_count,
+                    proposals_per_state=2,
+                    source_provenance={
+                        "schema_version": (
+                            "shopping-first-decision-source-provenance-v2"
+                        ),
+                        "git_sha": "c" * 40,
+                        "git_worktree_clean": stage1_clean,
+                        "git_status_sha256": hashlib.sha256(
+                            b"" if stage1_clean else b" M dirty.py"
+                        ).hexdigest(),
+                        "execution_mode": (
+                            "formal" if stage1_clean else "mechanical"
+                        ),
+                        "dirty_source_override": not stage1_clean,
+                        "scale_ready": stage1_clean,
+                    },
+                ).collect(artifact_root / "stage1-journal")
+            )
+            stage1 = stage1_collection["records"]
+        else:
+            stage1 = asyncio.run(
+                ActiveSuffixRunner(
+                    plan=plan,
+                    resolved_selections=resolved,
+                    actor_checkpoint=actor,
+                    sampling_backend_contract=backend,
+                    completion_client=FakePlanBoundClient(),
+                    parser=FakeParser(),
+                    encoder=FakeEncoder(),
+                    env_factory=FakeEnvironment,
+                    expected_groups=state_count,
+                    expected_suffixes_per_state=2,
+                ).collect()
+            )["records"]
         if stage1_mutator is not None:
             stage1 = copy.deepcopy(stage1)
             stage1_mutator(stage1)
+        stage1_records_path = None
+        stage1_manifest_path = None
+        stage1_source_sha256 = "d" * 64
+        if formal_stage1:
+            stage1_records_path = artifact_root / "stage1.jsonl"
+            stage1_manifest_path = artifact_root / "stage1-manifest.json"
+            write_first_decision_artifacts(
+                stage1_collection,
+                records_output=stage1_records_path,
+                manifest_output=stage1_manifest_path,
+            )
+            stage1_source_sha256 = hashlib.sha256(
+                stage1_records_path.read_bytes()
+            ).hexdigest()
+        actor_attestor = (
+            ActorCheckpointRunAttestation(actor, actor_sha)
+            if use_actor_attestor or formal_stage1
+            else None
+        )
         return NestedContinuationCollector(
             plan=plan,
             resolved_selections=resolved,
             stage1_records=stage1,
-            stage1_source_sha256="d" * 64,
+            stage1_source_sha256=stage1_source_sha256,
+            stage1_records_path=stage1_records_path,
+            stage1_manifest_path=stage1_manifest_path,
             actor_checkpoint=actor,
             sampling_backend_contract=backend,
-            completion_client=AlwaysBuyClient(),
+            completion_client=nested_client or AlwaysBuyClient(),
             parser=FakeParser(),
             encoder=encoder or FakeEncoder(),
             env_factory=env_factory,
             tool_schemas=SHOP_TOOL_SCHEMAS,
             required_environment_version="shopsimulator-environment-v2.1",
             continuations_per_decision=continuations_per_decision,
+            actor_checkpoint_attestor=actor_attestor,
         )
+
+    def test_formal_nested_source_rejects_allow_dirty_stage1_artifact(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            self.assertRaisesRegex(ValueError, "clean Git"),
+        ):
+            self._collector(
+                tmp,
+                formal_stage1=True,
+                stage1_clean=False,
+            )
+
+    def test_formal_actor_collection_requires_completion_intent_observer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = self._collector(tmp, formal_stage1=True)
+            with self.assertRaisesRegex(
+                ActiveSuffixInfrastructureError,
+                "requires a completion intent observer",
+            ):
+                asyncio.run(collector.collect())
+            collector.forced_client.actor_checkpoint_attestor.finish()
+
+    def test_journal_resume_is_idempotent_and_does_not_resample_completed_slots(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            tempfile.TemporaryDirectory() as journal_tmp,
+        ):
+            client = AlwaysBuyClient()
+            collector = self._collector(
+                tmp,
+                nested_client=client,
+                use_actor_attestor=True,
+            )
+            attestor = collector.forced_client.actor_checkpoint_attestor
+            binding = attestor.verify_runtime(
+                actor_checkpoint=Path(tmp),
+                actor_checkpoint_sha256=collector.runner.plan[
+                    "actor_checkpoint_sha256"
+                ],
+            )
+            journal = NestedContinuationJournal(
+                Path(journal_tmp) / "journal",
+                collector.journal_contract(binding),
+            )
+            journal.begin_actor_run(attestor.report())
+            collector.set_completion_intent_observer(
+                journal.begin_completion_request
+            )
+
+            def interrupt_after_two(record, boundary):
+                journal.append(record, boundary)
+                if len(journal.entries()) == 2:
+                    raise RuntimeError("simulated interruption")
+
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                asyncio.run(
+                    collector.collect(persist_continuation=interrupt_after_two)
+                )
+            self.assertEqual(len(journal.entries()), 2)
+            calls_after_interruption = client.calls
+
+            resumed = asyncio.run(
+                collector.collect(
+                    resumed_entries=journal.entries(),
+                    persist_continuation=journal.append,
+                )
+            )
+            actor_report = attestor.finish()
+            journal.finish_actor_run(actor_report)
+            journal_report = journal.finalize()
+
+        self.assertEqual(len(resumed["continuations"]), 4)
+        self.assertEqual(client.calls - calls_after_interruption, 2)
+        self.assertEqual(client.attestations, 1)
+        self.assertEqual(journal_report["record_count"], 4)
+        self.assertTrue(actor_report["completed"])
+        self.assertGreaterEqual(actor_report["runtime_stat_checks"], 4)
+
+    def test_restart_after_last_journal_write_finalizes_without_resampling(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            tempfile.TemporaryDirectory() as journal_tmp,
+        ):
+            first_client = AlwaysBuyClient()
+            first = self._collector(
+                tmp,
+                nested_client=first_client,
+                formal_stage1=True,
+            )
+            first_attestor = first.forced_client.actor_checkpoint_attestor
+            first_binding = first_attestor.verify_runtime(
+                actor_checkpoint=first.runner.actor_checkpoint,
+                actor_checkpoint_sha256=first.runner.plan[
+                    "actor_checkpoint_sha256"
+                ],
+            )
+            journal_root = Path(journal_tmp) / "journal"
+            journal = NestedContinuationJournal(
+                journal_root,
+                first.journal_contract(first_binding),
+            )
+            journal.begin_actor_run(first_attestor.report())
+            first.set_completion_intent_observer(
+                journal.begin_completion_request
+            )
+            expected_records = len(first.expected_continuation_uids())
+
+            def crash_after_last_write(record, boundary):
+                journal.append(record, boundary)
+                if len(journal.entries()) == expected_records:
+                    raise RuntimeError("crash after final journal write")
+
+            with self.assertRaisesRegex(RuntimeError, "final journal write"):
+                asyncio.run(
+                    first.collect(persist_continuation=crash_after_last_write)
+                )
+            self.assertEqual(len(journal.entries()), expected_records)
+
+            actor = first.runner.actor_checkpoint
+            stage1_records_path = Path(tmp) / "stage1.jsonl"
+            stage1_manifest_path = Path(tmp) / "stage1-manifest.json"
+            stage1_records = [
+                json.loads(line)
+                for line in stage1_records_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if line.strip()
+            ]
+            second_client = AlwaysBuyClient()
+            second_attestor = ActorCheckpointRunAttestation(
+                actor,
+                first.runner.plan["actor_checkpoint_sha256"],
+            )
+            second = NestedContinuationCollector(
+                plan=first.runner.plan,
+                resolved_selections=first.runner.resolved,
+                stage1_records=stage1_records,
+                stage1_source_sha256=hashlib.sha256(
+                    stage1_records_path.read_bytes()
+                ).hexdigest(),
+                stage1_records_path=stage1_records_path,
+                stage1_manifest_path=stage1_manifest_path,
+                actor_checkpoint=actor,
+                sampling_backend_contract=first.runner.backend_contract,
+                completion_client=second_client,
+                parser=FakeParser(),
+                encoder=FakeEncoder(),
+                env_factory=FakeEnvironment,
+                tool_schemas=SHOP_TOOL_SCHEMAS,
+                required_environment_version=(
+                    "shopsimulator-environment-v2.1"
+                ),
+                continuations_per_decision=4,
+                actor_checkpoint_attestor=second_attestor,
+            )
+            second_binding = second_attestor.verify_runtime(
+                actor_checkpoint=actor,
+                actor_checkpoint_sha256=first.runner.plan[
+                    "actor_checkpoint_sha256"
+                ],
+            )
+            resumed_journal = NestedContinuationJournal(
+                journal_root,
+                second.journal_contract(second_binding),
+            )
+            resumed_journal.begin_actor_run(second_attestor.report())
+            second.set_completion_intent_observer(
+                resumed_journal.begin_completion_request
+            )
+            resumed = asyncio.run(
+                second.collect(resumed_entries=resumed_journal.entries())
+            )
+            actor_report = second_attestor.finish()
+            resumed_journal.finish_actor_run(actor_report)
+            journal_report = resumed_journal.finalize()
+            actor_chain = resumed_journal.actor_run_chain_report(
+                require_complete=True
+            )
+            finalized = finalize_scale_ready_collection(
+                resumed,
+                journal_path=resumed_journal.root,
+                journal_report=journal_report,
+                actor_attestation=actor_report,
+            )
+
+        self.assertEqual(second_client.calls, 0)
+        self.assertEqual(actor_chain["run_count"], 2)
+        self.assertEqual(
+            actor_chain["runs"][0]["closure_kind"], "successor_start"
+        )
+        self.assertEqual(
+            actor_chain["runs"][1]["closure_kind"], "graceful_end"
+        )
+        self.assertEqual(
+            actor_chain["runs"][0]["record_count"], expected_records
+        )
+        self.assertEqual(
+            resumed["summary"]["safety"]["completion_calls"],
+            resumed["summary"]["safety"][
+                "actor_stat_checked_completion_calls"
+            ],
+        )
+        self.assertTrue(
+            finalized["summary"]["safety"]["scale_collection_ready"]
+        )
+
+    def test_resume_fails_closed_after_response_before_wal_entry(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            tempfile.TemporaryDirectory() as journal_tmp,
+        ):
+            client = AlwaysBuyClient()
+            collector = self._collector(
+                tmp,
+                nested_client=client,
+                use_actor_attestor=True,
+            )
+            attestor = collector.forced_client.actor_checkpoint_attestor
+            binding = attestor.verify_runtime(
+                actor_checkpoint=Path(tmp),
+                actor_checkpoint_sha256=collector.runner.plan[
+                    "actor_checkpoint_sha256"
+                ],
+            )
+            journal_root = Path(journal_tmp) / "journal"
+            contract = collector.journal_contract(binding)
+            journal = NestedContinuationJournal(journal_root, contract)
+            journal.begin_actor_run(attestor.report())
+            collector.set_completion_intent_observer(
+                journal.begin_completion_request
+            )
+
+            def crash_before_entry(_record, _boundary):
+                raise RuntimeError("response returned before WAL entry")
+
+            with self.assertRaisesRegex(RuntimeError, "before WAL entry"):
+                asyncio.run(
+                    collector.collect(
+                        persist_continuation=crash_before_entry
+                    )
+                )
+            self.assertGreater(client.calls, 0)
+            self.assertTrue(any(journal.intents_root.glob("*.json")))
+
+            with self.assertRaisesRegex(ValueError, "unclosed.*fail closed"):
+                NestedContinuationJournal(journal_root, contract)
 
     def test_duplicate_exact_proposals_share_four_fresh_continuations(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1858,6 +2297,62 @@ class NestedContinuationCollectorTest(unittest.TestCase):
                 for decision in result["decisions"]
                 if invalid[0]["decision_uid"] == decision["decision_uid"]
             )["credit_eligible"]
+        )
+
+    def test_finalized_stage1_harness_termination_replays_without_resampling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = AlwaysBuyClient()
+            collector = self._collector(
+                tmp,
+                formal_stage1=True,
+                resolved_factory=resolved_initial_branch,
+                decoding_overrides={"max_assistant_turns": 1},
+                nested_client=client,
+            )
+            collector.set_completion_intent_observer(
+                _in_memory_completion_intent
+            )
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+            actor_report = collector.forced_client.actor_checkpoint_attestor.finish()
+
+        self.assertEqual(client.calls, 0)
+        self.assertTrue(actor_report["completed"])
+        self.assertTrue(result["summary"]["safety"]["finalized_stage1_source"])
+        self.assertTrue(
+            result["summary"]["safety"]["actor_prehashed_backend_binding"]
+        )
+        self.assertEqual(len(result["continuations"]), 8)
+        self.assertTrue(
+            all(
+                item["generation_mode"] == "deterministic_terminal"
+                and item["downstream_request_seeds"] == []
+                for item in result["continuations"]
+            )
+        )
+
+    def test_finalized_stage1_unknown_malformed_arguments_keep_unknown_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = self._collector(
+                tmp,
+                formal_stage1=True,
+                resolved_factory=resolved_initial_branch,
+                stage1_client=FixedCompletionClient([49]),
+            )
+            collector.set_completion_intent_observer(
+                _in_memory_completion_intent
+            )
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+            collector.forced_client.actor_checkpoint_attestor.finish()
+
+        self.assertEqual(
+            result["decisions"][0]["first_action"],
+            canonical_replay_action("unknown_tool", {}),
+        )
+        self.assertEqual(len(result["continuations"]), 4)
+        self.assertTrue(
+            all(not item["infrastructure_invalid"] for item in result["continuations"])
         )
 
     def test_parser_mismatch_aborts_as_infrastructure_contract_drift(self):

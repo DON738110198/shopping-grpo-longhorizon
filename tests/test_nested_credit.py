@@ -10,6 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from test_active_suffix import (
+    MANIFEST_SHA256,
+    TOKENIZER_SHA256,
     AlwaysBuyClient,
     FakeEncoder,
     FakeEnvironment,
@@ -24,8 +26,17 @@ from scripts.estimate_nested_credit import main as estimate_credit_main
 from shopping_grpo.environment.tools import SHOP_TOOL_SCHEMAS
 from shopping_grpo.training.grpo.active_branch import build_active_branch_plan
 from shopping_grpo.training.grpo.active_suffix import (
-    ActiveSuffixRunner,
+    _sha256_json,
     sha256_actor_checkpoint,
+)
+from shopping_grpo.training.grpo.nested_artifacts import (
+    ACTOR_RUN_ATTESTATION_VERSION,
+    NESTED_REQUEST_INTENT_VERSION,
+    ActorCheckpointRunAttestation,
+    NestedContinuationJournal,
+    build_nested_journal_contract,
+    commit_nested_collection_artifacts,
+    finalize_scale_ready_collection,
 )
 from shopping_grpo.training.grpo.nested_continuation import (
     NestedContinuationCollector,
@@ -46,6 +57,10 @@ from shopping_grpo.training.grpo.nested_credit import (
 from shopping_grpo.training.grpo.pivotal_states import (
     canonical_replay_action,
     replay_action_sha256,
+)
+from shopping_grpo.training.grpo.stage1_proposal import (
+    FirstDecisionStage1Collector,
+    write_first_decision_artifacts,
 )
 
 
@@ -168,18 +183,52 @@ class NestedCreditEstimatorTests(unittest.TestCase):
         self.assertAlmostEqual(decision_b["q_d"], -0.5)
         self.assertAlmostEqual(decision_a["u_d"], 1.0 / 12.0)
         self.assertAlmostEqual(decision_b["u_d"], 1.0 / 12.0)
-        self.assertAlmostEqual(decision_a["kappa_d"], 15.0 / 23.0, places=6)
-        self.assertAlmostEqual(decision_a["q_tilde_d"], 19.0 / 46.0, places=6)
-        self.assertAlmostEqual(decision_b["q_tilde_d"], -11.0 / 46.0, places=6)
-        self.assertAlmostEqual(state["v_s"], 0.25, places=6)
-        self.assertAlmostEqual(decision_a["advantage"], 15.0 / 92.0, places=6)
-        self.assertAlmostEqual(decision_b["advantage"], -45.0 / 92.0, places=6)
+        self.assertAlmostEqual(decision_a["kappa_d"], 15.0 / 16.0, places=6)
+        self.assertAlmostEqual(decision_b["kappa_d"], 5.0 / 8.0, places=6)
+        self.assertAlmostEqual(decision_a["q_tilde_d"], 31.0 / 64.0, places=6)
+        self.assertAlmostEqual(decision_b["q_tilde_d"], -7.0 / 32.0, places=6)
+        self.assertAlmostEqual(state["v_s"], 79.0 / 256.0, places=6)
+        self.assertAlmostEqual(decision_a["advantage"], 1.0 / 6.0, places=6)
+        self.assertAlmostEqual(decision_b["advantage"], -0.5, places=6)
         self.assertEqual(decision_a["loss_weight"], 3)
         self.assertAlmostEqual(
             sum(row["loss_weight"] * row["advantage"] for row in state["decision_values"]),
             0.0,
         )
         self.assertFalse(result["estimator_contract"]["standard_deviation_normalization"])
+
+    def test_crn_covariance_uses_all_paired_slots_and_stays_psd(self) -> None:
+        payload = _payload(
+            [
+                _state(
+                    0,
+                    [
+                        [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.0, -1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0],
+                    ],
+                    [0, 0, 1, 1],
+                )
+            ]
+        )
+
+        result = estimate_nested_decision_credit(payload)
+
+        covariance = result["states"][0]["paired_crn_covariance"]
+        self.assertTrue(covariance["slot_alignment_verified"])
+        self.assertTrue(
+            covariance["full_decision_slot_cartesian_product_verified"]
+        )
+        self.assertTrue(covariance["psd_by_convex_construction"])
+        self.assertEqual(covariance["slot_indices"], [0, 1, 2, 3])
+        self.assertAlmostEqual(
+            covariance["raw_covariance_of_means"][0][1], 1.0 / 12.0
+        )
+        self.assertAlmostEqual(
+            covariance["shrunk_covariance_of_means"][0][1], 1.0 / 24.0
+        )
+        self.assertAlmostEqual(
+            result["states"][0]["weighted_uncertainty"], 1.0 / 48.0
+        )
 
     def test_advantage_is_clipped_to_half(self) -> None:
         state = _state(0, [[1.0] * 8, [-1.0] * 8], [0, 1, 1, 1])
@@ -402,8 +451,10 @@ class NestedCollectionAdapterTests(unittest.TestCase):
         stage1_client=None,
         env_factory=FakeEnvironment,
     ):
-        (root / "weights.bin").write_bytes(b"weights")
-        actor_sha = sha256_actor_checkpoint(root)
+        actor = root / "actor"
+        actor.mkdir()
+        (actor / "weights.bin").write_bytes(b"weights")
+        actor_sha = sha256_actor_checkpoint(actor)
         decoding, backend = decoding_and_backend(actor_sha)
         resolved = resolved_rows or [resolved_branch(17, [10, 20])]
         plan = build_active_branch_plan(
@@ -413,28 +464,55 @@ class NestedCollectionAdapterTests(unittest.TestCase):
             seed=20260811,
             suffixes_per_state=suffixes_per_state,
         )
-        stage1 = asyncio.run(
-            ActiveSuffixRunner(
-                plan=plan,
-                resolved_selections=resolved,
-                actor_checkpoint=root,
-                sampling_backend_contract=backend,
-                completion_client=stage1_client or FakePlanBoundClient(),
-                parser=FakeParser(),
-                encoder=FakeEncoder(),
-                env_factory=FakeEnvironment,
-                expected_groups=len(resolved),
-                expected_suffixes_per_state=suffixes_per_state,
-            ).collect()
-        )["records"]
+        stage1_collector = FirstDecisionStage1Collector(
+            plan=plan,
+            resolved_selections=resolved,
+            actor_checkpoint=actor,
+            actor_tokenizer_contract_sha256=TOKENIZER_SHA256,
+            sampling_backend_contract=backend,
+            completion_client=stage1_client or FakePlanBoundClient(),
+            parser=FakeParser(),
+            tool_schemas=SHOP_TOOL_SCHEMAS,
+            required_environment_version="shopsimulator-environment-v2.1",
+            expected_states=len(resolved),
+            proposals_per_state=suffixes_per_state,
+            source_provenance={
+                "schema_version": (
+                    "shopping-first-decision-source-provenance-v2"
+                ),
+                "git_sha": "c" * 40,
+                "git_worktree_clean": True,
+                "git_status_sha256": hashlib.sha256(b"").hexdigest(),
+                "execution_mode": "formal",
+                "dirty_source_override": False,
+                "scale_ready": True,
+            },
+        )
+        stage1_collection = asyncio.run(
+            stage1_collector.collect(root / "stage1-journal")
+        )
+        stage1 = stage1_collection["records"]
         if stage1_mutator is not None:
             stage1_mutator(stage1)
+        stage1_records_path = root / "stage1.jsonl"
+        stage1_manifest_path = root / "stage1-manifest.json"
+        write_first_decision_artifacts(
+            stage1_collection,
+            records_output=stage1_records_path,
+            manifest_output=stage1_manifest_path,
+        )
+        stage1_source_sha256 = hashlib.sha256(
+            stage1_records_path.read_bytes()
+        ).hexdigest()
+        actor_attestor = ActorCheckpointRunAttestation(actor, actor_sha)
         collector = NestedContinuationCollector(
             plan=plan,
             resolved_selections=resolved,
             stage1_records=stage1,
-            stage1_source_sha256="d" * 64,
-            actor_checkpoint=root,
+            stage1_source_sha256=stage1_source_sha256,
+            stage1_records_path=stage1_records_path,
+            stage1_manifest_path=stage1_manifest_path,
+            actor_checkpoint=actor,
             sampling_backend_contract=backend,
             completion_client=AlwaysBuyClient(),
             parser=FakeParser(),
@@ -444,9 +522,40 @@ class NestedCollectionAdapterTests(unittest.TestCase):
             required_environment_version="shopsimulator-environment-v2.1",
             expected_proposals=len(resolved) * suffixes_per_state,
             continuations_per_decision=continuations_per_decision,
+            actor_checkpoint_attestor=actor_attestor,
         )
+        request_intents = []
+
+        def record_request_intent(intent):
+            normalized = {
+                "schema_version": NESTED_REQUEST_INTENT_VERSION,
+                "intent_uid": _sha256_json(
+                    {
+                        "schema_version": NESTED_REQUEST_INTENT_VERSION,
+                        **intent,
+                    }
+                ),
+                **copy.deepcopy(intent),
+            }
+            normalized["intent_sha256"] = _sha256_json(normalized)
+            request_intents.append(normalized)
+            return normalized
+
+        collector.set_completion_intent_observer(record_request_intent)
+        collection = asyncio.run(collector.collect())
+        actor_attestation = actor_attestor.finish()
+        if not hasattr(self, "_scale_contexts"):
+            self._scale_contexts = {}
+        self._scale_contexts[str(root.resolve())] = {
+            "actor": actor,
+            "actor_attestation": actor_attestation,
+            "stage1_records_path": stage1_records_path,
+            "stage1_manifest_path": stage1_manifest_path,
+            "stage1_source_sha256": stage1_source_sha256,
+            "request_intents": request_intents,
+        }
         return (
-            asyncio.run(collector.collect()),
+            collection,
             plan,
             resolved,
             stage1,
@@ -463,9 +572,12 @@ class NestedCollectionAdapterTests(unittest.TestCase):
         backend,
         *,
         persisted_collection=None,
+        environment_manifest_sha256=MANIFEST_SHA256,
     ):
         manifest = json.loads(Path("data/environment.json").read_text(encoding="utf-8"))
         persisted = persisted_collection or collection
+        scale_context = self._scale_contexts[str(root.resolve())]
+        actor = scale_context["actor"]
         with tempfile.TemporaryDirectory() as artifact_tmp:
             artifact_root = Path(artifact_tmp)
             artifact_files = {
@@ -473,29 +585,122 @@ class NestedCollectionAdapterTests(unittest.TestCase):
                 "continuations": artifact_root / "continuations.jsonl",
                 "summary": artifact_root / "summary.json",
             }
-            for name in ("decisions", "continuations"):
-                artifact_files[name].write_text(
-                    "".join(
-                        json.dumps(row, sort_keys=True) + "\n"
-                        for row in persisted[name]
-                    ),
-                    encoding="utf-8",
+            actor_attestation = scale_context["actor_attestation"]
+            persisted_summary = persisted["summary"]
+            actor_binding = {
+                "schema_version": ACTOR_RUN_ATTESTATION_VERSION,
+                "actor_checkpoint_sha256": actor_attestation[
+                    "actor_checkpoint_sha256"
+                ],
+                "stat_snapshot_sha256": actor_attestation[
+                    "stat_snapshot_sha256"
+                ],
+                "stat_entry_count": actor_attestation["stat_entry_count"],
+                "read_only_run_binding": True,
+            }
+            journal_contract = build_nested_journal_contract(
+                experiment_uid=persisted_summary["experiment_uid"],
+                active_plan_sha256=persisted_summary["plan_sha256"],
+                formal_plan_sha256=persisted_summary["formal_plan_sha256"],
+                resolved_selections_sha256=persisted_summary[
+                    "resolved_selections_sha256"
+                ],
+                stage1_source_sha256=persisted_summary["stage1_source_sha256"],
+                stage1_manifest_sha256=persisted_summary["provenance"][
+                    "stage1_source_binding"
+                ]["final_manifest_sha256"],
+                stage1_source_finalized=True,
+                harness_contract_sha256=persisted_summary[
+                    "harness_contract_sha256"
+                ],
+                actor_runtime_binding=actor_binding,
+                continuations_per_decision=persisted_summary["aggregate"][
+                    "continuations_per_decision"
+                ],
+                expected_continuation_uids=[
+                    continuation_uid_value
+                    for decision in persisted["decisions"]
+                    for continuation_uid_value in decision["continuation_uids"]
+                ],
+            )
+            journal = NestedContinuationJournal(
+                artifact_root / "journal", journal_contract
+            )
+            journal.begin_actor_run(actor_attestation)
+            boundaries = {
+                decision["decision_uid"]: decision.get("post_action_boundary")
+                for decision in persisted["decisions"]
+            }
+            for continuation in persisted["continuations"]:
+                for intent in scale_context["request_intents"]:
+                    if (
+                        intent["continuation_uid"]
+                        != continuation["continuation_uid"]
+                    ):
+                        continue
+                    journal.begin_completion_request(
+                        {
+                            name: intent[name]
+                            for name in (
+                                "continuation_uid",
+                                "actor_run_uid",
+                                "actor_stat_snapshot_sha256",
+                                "request_index",
+                                "seed",
+                                "prompt_sha256",
+                            )
+                        }
+                    )
+                journal.append(
+                    continuation,
+                    boundaries.get(continuation["decision_uid"]),
                 )
-            artifact_files["summary"].write_text(
-                json.dumps(persisted["summary"], sort_keys=True) + "\n",
-                encoding="utf-8",
+            journal.finish_actor_run(actor_attestation)
+            journal_report = journal.finalize()
+            finalized_persisted = finalize_scale_ready_collection(
+                persisted,
+                journal_path=journal.root,
+                journal_report=journal_report,
+                actor_attestation=actor_attestation,
+            )
+            if collection is persisted_collection or collection is persisted:
+                finalized_collection = finalized_persisted
+            else:
+                finalized_collection = copy.deepcopy(collection)
+                finalized_collection["summary"]["safety"] = copy.deepcopy(
+                    finalized_persisted["summary"]["safety"]
+                )
+                finalized_collection["summary"]["provenance"][
+                    "scale_storage_contract"
+                ] = copy.deepcopy(
+                    finalized_persisted["summary"]["provenance"][
+                        "scale_storage_contract"
+                    ]
+                )
+            collection_manifest = artifact_root / "collection-manifest.json"
+            commit_nested_collection_artifacts(
+                finalized_persisted,
+                artifact_files=artifact_files,
+                manifest_path=collection_manifest,
+                journal_path=journal.root,
+                journal_report=journal_report,
+                actor_attestation=actor_attestation,
             )
             return estimate_nested_collection_credit(
-                collection,
-                actor_checkpoint=root,
+                finalized_collection,
+                actor_checkpoint=actor,
                 environment_manifest=manifest,
-                environment_manifest_sha256="a" * 64,
+                environment_manifest_path=Path("data/environment.json"),
+                environment_manifest_sha256=environment_manifest_sha256,
                 active_branch_plan=plan,
                 resolved_selections=resolved,
                 stage1_records=stage1,
-                stage1_source_sha256="d" * 64,
+                stage1_source_sha256=scale_context["stage1_source_sha256"],
+                stage1_records_path=scale_context["stage1_records_path"],
+                stage1_manifest=scale_context["stage1_manifest_path"],
                 sampling_backend_contract=backend,
                 artifact_files=artifact_files,
+                collection_manifest=collection_manifest,
             )
 
     def test_real_adapter_attests_source_but_mechanical_l4_stays_locked(self) -> None:
@@ -517,6 +722,38 @@ class NestedCollectionAdapterTests(unittest.TestCase):
         self.assertGreaterEqual(
             report["source_contract"]["duplicate_semantic_rollout_count"], 1
         )
+
+    def test_adapter_recomputes_environment_manifest_file_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collection, plan, resolved, stage1, backend = self._artifacts(root)
+
+            with self.assertRaisesRegex(ValueError, "file SHA256 mismatch"):
+                self._estimate(
+                    collection,
+                    root,
+                    plan,
+                    resolved,
+                    stage1,
+                    backend,
+                    environment_manifest_sha256="a" * 64,
+                )
+
+    def test_adapter_rejects_tampered_stage1_completion_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collection, plan, resolved, stage1, backend = self._artifacts(root)
+            manifest_path = self._scale_contexts[str(root.resolve())][
+                "stage1_manifest_path"
+            ]
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["status"] = "incomplete"
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "version or status"):
+                self._estimate(collection, root, plan, resolved, stage1, backend)
 
     def test_policy_reward_is_recomputed_from_bound_public_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -579,7 +816,7 @@ class NestedCollectionAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "sampling-invalid flag mismatch"):
                 self._estimate(tampered, root, plan, resolved, stage1, backend)
 
-    def test_adapter_rejects_discarding_a_model_failure_as_sampling_invalid(self) -> None:
+    def test_scale_gate_rejects_discarding_a_model_failure_as_sampling_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             collection, plan, resolved, stage1, backend = self._artifacts(root)
@@ -596,7 +833,9 @@ class NestedCollectionAdapterTests(unittest.TestCase):
             continuation.pop("rollout_content_sha256")
             continuation.update(_with_rollout_content_sha256(continuation))
 
-            with self.assertRaisesRegex(ValueError, "must remain learning-valid"):
+            with self.assertRaisesRegex(
+                ValueError, "aggregate is not collector-consistent"
+            ):
                 self._estimate(tampered, root, plan, resolved, stage1, backend)
 
     def test_attested_reward_unverifiable_is_excluded_from_q_not_rejected(self) -> None:
@@ -723,6 +962,9 @@ class NestedCollectionAdapterTests(unittest.TestCase):
                 copied["state_uid"], 1, 0
             )
             copied["downstream_request_seeds"] = [copied["first_downstream_seed"]]
+            copied["completion_intent_uids"] = list(
+                tampered["continuations"][1]["completion_intent_uids"]
+            )
             copied = _with_rollout_content_sha256(copied)
             tampered["continuations"][1] = copied
             decision["continuation_uids"][1] = copied["continuation_uid"]
@@ -733,7 +975,15 @@ class NestedCollectionAdapterTests(unittest.TestCase):
 
 class NestedCreditCliTests(unittest.TestCase):
     def _argv(self, root: Path) -> list[str]:
-        json_paths = ("summary", "environment", "plan", "selection", "backend")
+        json_paths = (
+            "summary",
+            "collection-manifest",
+            "environment",
+            "plan",
+            "selection",
+            "backend",
+            "stage1-manifest",
+        )
         for name in json_paths:
             (root / f"{name}.json").write_text("{}\n", encoding="utf-8")
         jsonl_paths = ("decisions", "continuations", "stage1", "input")
@@ -747,6 +997,8 @@ class NestedCreditCliTests(unittest.TestCase):
             str(root / "continuations.jsonl"),
             "--summary",
             str(root / "summary.json"),
+            "--collection-manifest",
+            str(root / "collection-manifest.json"),
             "--actor-checkpoint",
             str(root / "actor"),
             "--environment-manifest",
@@ -759,6 +1011,8 @@ class NestedCreditCliTests(unittest.TestCase):
             str(root / "input.jsonl"),
             "--stage1-source",
             str(root / "stage1.jsonl"),
+            "--stage1-manifest",
+            str(root / "stage1-manifest.json"),
             "--sampling-backend-contract",
             str(root / "backend.json"),
             "--output",

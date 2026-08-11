@@ -443,13 +443,65 @@ class VllmTokenCompletionClient:
         actor_checkpoint_sha256: str,
     ) -> _PlanBoundCompletionClient:
         """Query the live server, hash its loaded root, and bind one exact plan."""
-        expected = validate_sampling_backend_contract(expected_contract)
-        if sampling_backend_contract_sha256(expected) != expected_contract_sha256:
-            raise ActiveSuffixInfrastructureError("sampling backend contract SHA256 mismatch")
         live = self.inspect_backend(
             actor_checkpoint=actor_checkpoint,
             actor_checkpoint_sha256=actor_checkpoint_sha256,
         )
+        return self._bind_verified_live_backend(
+            plan_sha256=plan_sha256,
+            expected_contract=expected_contract,
+            expected_contract_sha256=expected_contract_sha256,
+            decoding_config=decoding_config,
+            actor_checkpoint_sha256=actor_checkpoint_sha256,
+            live=live,
+        )
+
+    def attest_and_bind_prehashed(
+        self,
+        *,
+        plan_sha256: str,
+        expected_contract: Mapping[str, object],
+        expected_contract_sha256: str,
+        decoding_config: Mapping[str, object],
+        actor_checkpoint: str | Path,
+        actor_checkpoint_sha256: str,
+        actor_runtime_binding: Mapping[str, object],
+    ) -> _PlanBoundCompletionClient:
+        """Bind live metadata to an independently full-hashed actor run."""
+        if (
+            not isinstance(actor_runtime_binding, Mapping)
+            or actor_runtime_binding.get("read_only_run_binding") is not True
+            or actor_runtime_binding.get("actor_checkpoint_sha256")
+            != actor_checkpoint_sha256
+            or not _is_sha256(actor_runtime_binding.get("stat_snapshot_sha256"))
+        ):
+            raise ActiveSuffixInfrastructureError(
+                "prehashed actor runtime binding is invalid"
+            )
+        live = self._inspect_backend_metadata(actor_checkpoint=actor_checkpoint)
+        live["served_model_root_sha256"] = actor_checkpoint_sha256
+        return self._bind_verified_live_backend(
+            plan_sha256=plan_sha256,
+            expected_contract=expected_contract,
+            expected_contract_sha256=expected_contract_sha256,
+            decoding_config=decoding_config,
+            actor_checkpoint_sha256=actor_checkpoint_sha256,
+            live=live,
+        )
+
+    def _bind_verified_live_backend(
+        self,
+        *,
+        plan_sha256: str,
+        expected_contract: Mapping[str, object],
+        expected_contract_sha256: str,
+        decoding_config: Mapping[str, object],
+        actor_checkpoint_sha256: str,
+        live: Mapping[str, object],
+    ) -> _PlanBoundCompletionClient:
+        expected = validate_sampling_backend_contract(expected_contract)
+        if sampling_backend_contract_sha256(expected) != expected_contract_sha256:
+            raise ActiveSuffixInfrastructureError("sampling backend contract SHA256 mismatch")
         actual = build_sampling_backend_contract(
             server_version=live["server_version"],
             served_model=live["served_model"],
@@ -472,13 +524,10 @@ class VllmTokenCompletionClient:
         self._bindings.add(binding_sha256)
         return _PlanBoundCompletionClient(self, binding_sha256, decoding_config)
 
-    def inspect_backend(
-        self,
-        *,
-        actor_checkpoint: str | Path,
-        actor_checkpoint_sha256: str,
+    def _inspect_backend_metadata(
+        self, *, actor_checkpoint: str | Path
     ) -> dict[str, object]:
-        """Read live vLLM metadata and cryptographically tie its root to the actor."""
+        """Read live identity without rehashing an independently attested tree."""
         version_response = self._get_json(self.version_url)
         models_response = self._get_json(self.models_url)
         if not isinstance(version_response, Mapping) or not isinstance(
@@ -495,31 +544,50 @@ class VllmTokenCompletionClient:
             if isinstance(item, Mapping) and item.get("id") == self.model
         ]
         if len(matches) != 1:
-            raise ActiveSuffixInfrastructureError("served model identity is ambiguous or missing")
+            raise ActiveSuffixInfrastructureError(
+                "served model identity is ambiguous or missing"
+            )
         model_info = matches[0]
         root_value = model_info.get("root")
         if not isinstance(root_value, str) or not root_value:
-            raise ActiveSuffixInfrastructureError("served model metadata is missing root")
+            raise ActiveSuffixInfrastructureError(
+                "served model metadata is missing root"
+            )
         served_root_path = Path(root_value).expanduser()
         if served_root_path.is_symlink():
-            raise ActiveSuffixInfrastructureError("vLLM served root is a symbolic link")
+            raise ActiveSuffixInfrastructureError(
+                "vLLM served root is a symbolic link"
+            )
+        actor_path = Path(actor_checkpoint).expanduser()
+        if served_root_path.resolve() != actor_path.resolve():
+            raise ActiveSuffixInfrastructureError(
+                "vLLM served root is not the requested actor"
+            )
+        max_model_len = model_info.get("max_model_len")
+        if not isinstance(max_model_len, int) or isinstance(max_model_len, bool):
+            raise ActiveSuffixInfrastructureError(
+                "served model max_model_len is invalid"
+            )
+        return {
+            "server_version": version_response["version"],
+            "served_model": self.model,
+            "max_model_len": max_model_len,
+        }
+
+    def inspect_backend(
+        self,
+        *,
+        actor_checkpoint: str | Path,
+        actor_checkpoint_sha256: str,
+    ) -> dict[str, object]:
+        """Read live vLLM metadata and cryptographically tie its root to the actor."""
+        live = self._inspect_backend_metadata(actor_checkpoint=actor_checkpoint)
         actor_path = Path(actor_checkpoint).expanduser()
         actor_sha256 = sha256_actor_checkpoint(actor_path)
         if actor_sha256 != actor_checkpoint_sha256:
             raise ActiveSuffixInfrastructureError("actor checkpoint SHA256 mismatch")
-        served_root = served_root_path.resolve()
-        actor_root = actor_path.resolve()
-        if served_root != actor_root:
-            raise ActiveSuffixInfrastructureError("vLLM served root is not the requested actor")
-        max_model_len = model_info.get("max_model_len")
-        if not isinstance(max_model_len, int) or isinstance(max_model_len, bool):
-            raise ActiveSuffixInfrastructureError("served model max_model_len is invalid")
-        return {
-            "server_version": version_response["version"],
-            "served_model": self.model,
-            "served_model_root_sha256": actor_sha256,
-            "max_model_len": max_model_len,
-        }
+        live["served_model_root_sha256"] = actor_sha256
+        return live
 
     def materialize_backend_contract(
         self,
@@ -1623,6 +1691,7 @@ class ActiveSuffixRunner:
                         state,
                         "assistant_finished_without_environment_done",
                     )
+                    observe_first_decision_boundary()
                     break
                 span = append_assistant_turn(
                     response_ids,
@@ -1665,6 +1734,7 @@ class ActiveSuffixRunner:
                         state,
                         "assistant_finished_without_environment_done",
                     )
+                    observe_first_decision_boundary()
                     break
                 calls = await self._parse(completion_ids)
                 if not calls:

@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 
 if __package__:
@@ -29,7 +30,21 @@ else:
         verify_verl_tool_observation_parity,
     )
 from shopping_grpo.environment.client import ShopAgentEnv
-from shopping_grpo.training.grpo.active_suffix import VllmTokenCompletionClient
+from shopping_grpo.training.grpo.active_suffix import (
+    VllmTokenCompletionClient,
+    _sha256_json,
+    sampling_backend_contract_sha256,
+    sha256_actor_checkpoint,
+    tool_schema_sha256,
+    validate_sampling_backend_contract,
+)
+from shopping_grpo.training.grpo.nested_artifacts import (
+    ActorCheckpointRunAttestation,
+    NestedContinuationJournal,
+    commit_nested_collection_artifacts,
+    finalize_scale_ready_collection,
+    verify_completed_collection_manifest,
+)
 from shopping_grpo.training.grpo.nested_continuation import (
     NestedContinuationCollector,
 )
@@ -44,6 +59,7 @@ def parse_args(argv=None):
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--input", type=Path, action="append", required=True)
     parser.add_argument("--active-suffixes", type=Path, required=True)
+    parser.add_argument("--stage1-manifest", type=Path, required=True)
     parser.add_argument("--actor-checkpoint", type=Path, required=True)
     parser.add_argument("--sampling-backend-contract", type=Path, required=True)
     parser.add_argument(
@@ -63,6 +79,8 @@ def parse_args(argv=None):
     parser.add_argument("--decisions-output", type=Path, required=True)
     parser.add_argument("--continuations-output", type=Path, required=True)
     parser.add_argument("--summary-output", type=Path, required=True)
+    parser.add_argument("--journal-dir", type=Path)
+    parser.add_argument("--manifest-output", type=Path)
     return parser.parse_args(argv)
 
 
@@ -72,6 +90,36 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _require_clean_git_head(expected_git_sha: object) -> str:
+    if (
+        not isinstance(expected_git_sha, str)
+        or len(expected_git_sha) != 40
+        or any(character not in "0123456789abcdef" for character in expected_git_sha)
+    ):
+        raise ValueError("formal nested source lacks a full Git commit SHA")
+
+    def run(*arguments: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", *arguments],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ValueError("formal nested Git attestation failed") from exc
+        return completed.stdout
+
+    current = run("rev-parse", "HEAD").strip().lower()
+    status = run("status", "--porcelain=v1", "--untracked-files=all")
+    if current != expected_git_sha or status:
+        raise ValueError(
+            "formal nested collection requires the clean Stage-1 Git commit"
+        )
+    return current
 
 
 def _jsonl(path: Path, name: str) -> list[dict]:
@@ -101,6 +149,7 @@ async def _run(args):
         "backend": args.sampling_backend_contract.expanduser().resolve(),
         "tools": args.tools_config.expanduser().resolve(),
         "stage1": args.active_suffixes.expanduser().resolve(),
+        "stage1_manifest": args.stage1_manifest.expanduser().resolve(),
     }
     inputs = [path.expanduser().resolve() for path in args.input]
     actor = args.actor_checkpoint.expanduser().absolute()
@@ -118,6 +167,12 @@ async def _run(args):
     plan = _load_object(paths["plan"], "active branch plan")
     selection = _load_object(paths["selection"], "pivotal selection")
     backend_contract = _load_object(paths["backend"], "sampling backend contract")
+    stage1_manifest = _load_object(
+        paths["stage1_manifest"], "Stage-1 completion manifest"
+    )
+    _require_clean_git_head(
+        (stage1_manifest.get("source_provenance") or {}).get("git_sha")
+    )
     stage1_records = _jsonl(paths["stage1"], "active suffixes")
     tool_schemas = _load_tool_schemas(paths["tools"])
     resolved = resolve_pivotal_selection(
@@ -126,10 +181,18 @@ async def _run(args):
         expected_inputs=provenance,
         require_prompt_capture=True,
     )
+    actor_attestor = ActorCheckpointRunAttestation(
+        actor,
+        str(plan.get("actor_checkpoint_sha256") or ""),
+    )
 
     from transformers import AutoProcessor
 
     processor = AutoProcessor.from_pretrained(actor, trust_remote_code=True)
+    actor_attestor.verify_runtime(
+        actor_checkpoint=actor,
+        actor_checkpoint_sha256=plan.get("actor_checkpoint_sha256"),
+    )
     tokenizer = processor.tokenizer
     parser = Qwen3CoderParser(tokenizer, tool_schemas)
     decoding = plan.get("decoding_config") or {}
@@ -151,6 +214,8 @@ async def _run(args):
         resolved_selections=resolved,
         stage1_records=stage1_records,
         stage1_source_sha256=_sha256(paths["stage1"]),
+        stage1_records_path=paths["stage1"],
+        stage1_manifest_path=paths["stage1_manifest"],
         actor_checkpoint=actor,
         sampling_backend_contract=backend_contract,
         completion_client=client,
@@ -166,49 +231,192 @@ async def _run(args):
         environment_timeout_seconds=args.environment_timeout,
         expected_proposals=args.expected_proposals,
         continuations_per_decision=args.continuations_per_decision,
+        actor_checkpoint_attestor=actor_attestor,
     )
-    return await collector.collect()
+    actor_binding = actor_attestor.verify_runtime(
+        actor_checkpoint=actor,
+        actor_checkpoint_sha256=plan.get("actor_checkpoint_sha256"),
+    )
+    journal = NestedContinuationJournal(
+        args.journal_dir,
+        collector.journal_contract(actor_binding),
+    )
+    completed_before_resume = journal.is_complete
+    if not completed_before_resume:
+        journal.begin_actor_run(actor_attestor.report())
+    collector.set_completion_intent_observer(journal.begin_completion_request)
+    collection = await collector.collect(
+        resumed_entries=journal.entries(),
+        persist_continuation=journal.append,
+    )
+    current_actor_report = actor_attestor.finish()
+    if completed_before_resume:
+        journal_report = journal.completion_report()
+        actor_report = journal.latest_actor_attestation()
+    else:
+        journal.finish_actor_run(current_actor_report)
+        actor_report = current_actor_report
+        journal_report = journal.finalize()
+    return {
+        "collection": finalize_scale_ready_collection(
+            collection,
+            journal_path=journal.root,
+            journal_report=journal_report,
+            actor_attestation=actor_report,
+        ),
+        "journal_report": journal_report,
+        "actor_attestation": actor_report,
+        "journal_path": journal.root,
+    }
 
 
-def _write_jsonl(path: Path, values: list[dict]) -> None:
-    with path.open("x", encoding="utf-8", newline="\n") as handle:
-        for value in values:
-            handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+def _verify_completed_request(args, manifest, summary) -> None:
+    """Refuse an idempotent exit when any requested source identity changed."""
+    source_contract = manifest.get("source_contract")
+    if not isinstance(source_contract, dict):
+        raise TypeError("completed nested source contract is missing")
+    requested_files = {
+        "plan": args.plan.expanduser().resolve(),
+        "selection": args.selection.expanduser().resolve(),
+        "backend": args.sampling_backend_contract.expanduser().resolve(),
+        "tools": args.tools_config.expanduser().resolve(),
+        "stage1": args.active_suffixes.expanduser().resolve(),
+        "stage1_manifest": args.stage1_manifest.expanduser().resolve(),
+    }
+    inputs = [path.expanduser().resolve() for path in args.input]
+    if any(not path.is_file() for path in [*requested_files.values(), *inputs]):
+        raise ValueError("a requested completed-run source file is missing")
+    actor = args.actor_checkpoint.expanduser().absolute()
+    if not actor.is_dir():
+        raise ValueError("requested completed-run actor checkpoint is missing")
+
+    plan = _load_object(requested_files["plan"], "active branch plan")
+    backend = validate_sampling_backend_contract(
+        _load_object(requested_files["backend"], "sampling backend contract")
+    )
+    selection = _load_object(requested_files["selection"], "pivotal selection")
+    provenance = [{"path": str(path), "sha256": _sha256(path)} for path in inputs]
+    resolved = resolve_pivotal_selection(
+        selection,
+        _records(inputs),
+        expected_inputs=provenance,
+        require_prompt_capture=True,
+    )
+    stage1_binding = source_contract.get("stage1_source_binding")
+    if not isinstance(stage1_binding, dict):
+        raise TypeError("completed nested Stage-1 binding is missing")
+    _require_clean_git_head(stage1_binding.get("source_git_sha"))
+    requested_tool_sha256 = tool_schema_sha256(
+        _load_tool_schemas(requested_files["tools"])
+    )
+    requested_actor_sha256 = sha256_actor_checkpoint(actor)
+    expected_proposals = stage1_binding.get("record_count")
+    if (
+        _sha256_json(plan) != source_contract.get("active_branch_plan_sha256")
+        or _sha256_json(resolved) != summary.get("resolved_selections_sha256")
+        or sampling_backend_contract_sha256(backend)
+        != source_contract.get("sampling_backend_contract_sha256")
+        or requested_actor_sha256
+        != source_contract.get("actor_checkpoint_sha256")
+        or requested_tool_sha256
+        != (plan.get("decoding_config") or {}).get("tool_schema_sha256")
+        or args.environment_version
+        != source_contract.get("required_environment_version")
+        or args.served_model != backend.get("served_model")
+        or args.continuations_per_decision
+        != (summary.get("aggregate") or {}).get("continuations_per_decision")
+        or (
+            args.expected_proposals is not None
+            and args.expected_proposals != expected_proposals
+        )
+        or _sha256(requested_files["stage1"])
+        != stage1_binding.get("records_file_sha256")
+        or _sha256(requested_files["stage1_manifest"])
+        != stage1_binding.get("final_manifest_sha256")
+    ):
+        raise ValueError("completed nested collection differs from the requested run")
 
 
 def main():
     args = parse_args()
-    outputs = [
-        args.decisions_output.expanduser().resolve(),
-        args.continuations_output.expanduser().resolve(),
-        args.summary_output.expanduser().resolve(),
-    ]
-    if len(set(outputs)) != len(outputs):
+    outputs = {
+        "decisions": args.decisions_output.expanduser().absolute(),
+        "continuations": args.continuations_output.expanduser().absolute(),
+        "summary": args.summary_output.expanduser().absolute(),
+    }
+    output_parent = outputs["summary"].parent
+    args.journal_dir = (
+        args.journal_dir.expanduser().absolute()
+        if args.journal_dir is not None
+        else output_parent / ".nested-continuation-journal"
+    )
+    args.manifest_output = (
+        args.manifest_output.expanduser().absolute()
+        if args.manifest_output is not None
+        else output_parent / "nested-collection-manifest.json"
+    )
+    if len(set(outputs.values())) != len(outputs):
         raise SystemExit("nested output paths must be distinct")
-    if any(path.exists() for path in outputs):
-        raise SystemExit("refusing to overwrite an existing nested artifact")
+    if args.manifest_output in outputs.values():
+        raise SystemExit("nested manifest path must be distinct from artifacts")
+    if any(path.parent != output_parent for path in outputs.values()) or (
+        args.manifest_output.parent != output_parent
+    ):
+        raise SystemExit("nested artifacts and manifest must share one directory")
     try:
-        collection = asyncio.run(_run(args))
+        args.journal_dir.relative_to(output_parent)
+    except ValueError as exc:
+        raise SystemExit(
+            "nested journal must be inside the artifact commit directory"
+        ) from exc
+    if args.manifest_output.exists():
+        try:
+            manifest = verify_completed_collection_manifest(
+                args.manifest_output,
+                artifact_files=outputs,
+            )
+            summary = json.loads(outputs["summary"].read_text(encoding="utf-8"))
+            _verify_completed_request(args, manifest, summary)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"completed nested manifest is invalid: {exc}") from exc
+        aggregate = summary["aggregate"]
+        print(
+            json.dumps(
+                {
+                    **aggregate,
+                    "artifact_set_uid": manifest["artifact_set_uid"],
+                    "already_committed": True,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        if aggregate["mechanical_collection_passed"] is not True:
+            raise SystemExit(2)
+        return
+    try:
+        result = asyncio.run(_run(args))
     except (ImportError, OSError, TypeError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"nested continuation collection failed: {exc}") from exc
-
-    for output in outputs:
-        output.parent.mkdir(parents=True, exist_ok=True)
-    temporaries = [path.with_suffix(path.suffix + ".tmp") for path in outputs]
     try:
-        _write_jsonl(temporaries[0], collection["decisions"])
-        _write_jsonl(temporaries[1], collection["continuations"])
-        temporaries[2].write_text(
-            json.dumps(collection["summary"], ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        manifest = commit_nested_collection_artifacts(
+            result["collection"],
+            artifact_files=outputs,
+            manifest_path=args.manifest_output,
+            journal_path=result["journal_path"],
+            journal_report=result["journal_report"],
+            actor_attestation=result["actor_attestation"],
         )
-        for temporary, output in zip(temporaries, outputs, strict=True):
-            temporary.replace(output)
-    finally:
-        for temporary in temporaries:
-            temporary.unlink(missing_ok=True)
-    aggregate = collection["summary"]["aggregate"]
-    print(json.dumps(aggregate, ensure_ascii=False, indent=2))
+    except (OSError, TypeError, ValueError) as exc:
+        raise SystemExit(f"nested artifact commit failed: {exc}") from exc
+    aggregate = result["collection"]["summary"]["aggregate"]
+    print(
+        json.dumps(
+            {**aggregate, "artifact_set_uid": manifest["artifact_set_uid"]},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     if aggregate["mechanical_collection_passed"] is not True:
         raise SystemExit(2)
 

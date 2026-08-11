@@ -13,6 +13,7 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from pathlib import Path
 
 from shopping_grpo.training.grpo import nested_structure as _nested_structure
 from shopping_grpo.training.grpo.active_suffix import (
@@ -23,6 +24,14 @@ from shopping_grpo.training.grpo.active_suffix import (
     _is_sha256,
     _sha256_json,
     sampling_backend_contract_sha256,
+)
+from shopping_grpo.training.grpo.nested_artifacts import (
+    NESTED_REQUEST_INTENT_VERSION,
+    _validate_record_request_intent_contract,
+    build_nested_journal_contract,
+    build_nested_stage1_source_binding,
+    sha256_file,
+    validate_nested_stage1_source_binding,
 )
 from shopping_grpo.training.grpo.nested_structure import (
     NESTED_DECISION_IDENTITY_VERSION,
@@ -35,16 +44,22 @@ from shopping_grpo.training.grpo.pivotal_states import (
     replay_action_sha256,
     token_ids_sha256,
 )
+from shopping_grpo.training.grpo.stage1_proposal import (
+    FIRST_DECISION_PROPOSAL_VERSION,
+    verify_first_decision_artifacts,
+)
 
-NESTED_DECISION_VERSION = "shopping-nested-decision-v1"
+NESTED_DECISION_VERSION = "shopping-nested-decision-v2"
 NESTED_CONTINUATION_VERSION = "shopping-nested-continuation-v2"
-NESTED_COLLECTION_VERSION = "shopping-nested-continuation-collection-v2"
+NESTED_COLLECTION_VERSION = "shopping-nested-continuation-collection-v3"
 NESTED_HARNESS_CONTRACT_VERSION = "shopping-nested-harness-contract-v2"
 NESTED_DECISION_CONTENT_VERSION = "shopping-nested-decision-content-v1"
 NESTED_SEED_SCHEDULE_VERSION = "shopping-nested-state-crn-seed-v1"
 NESTED_FOLD_CONTRACT_VERSION = "shopping-nested-train4-gate4-v1"
 NESTED_ROLLOUT_CONTENT_VERSION = "shopping-nested-rollout-content-v2"
 NESTED_EXCLUSION_AUDIT_VERSION = _nested_structure.NESTED_EXCLUSION_AUDIT_VERSION
+NESTED_FORMAL_PLAN_VERSION = "shopping-nested-formal-plan-v2"
+NESTED_FORMAL_GROUP_IDENTITY_VERSION = "shopping-nested-formal-group-identity-v2"
 
 MECHANICAL_CONTINUATIONS_PER_DECISION = 4
 FORMAL_CONTINUATIONS_PER_DECISION = 8
@@ -237,6 +252,112 @@ def build_nested_harness_contract(
     }
 
 
+def build_nested_formal_plan(
+    active_plan: Mapping[str, object],
+    resolved_selections: Sequence[Mapping[str, object]],
+    *,
+    required_environment_version: str,
+    policy_reward_sha256: str,
+    harness_contract_sha256: str,
+    sampling_backend_contract_sha256: str,
+) -> dict[str, object]:
+    """Upgrade active-plan groups to formal v2 identities used by Nested PSA."""
+    if not isinstance(active_plan, Mapping):
+        raise TypeError("active branch plan must be an object")
+    groups = active_plan.get("groups")
+    if not isinstance(groups, list) or len(groups) != len(resolved_selections):
+        raise ValueError("active plan/resolved groups differ for formal plan v2")
+    for name, value in {
+        "policy_reward_sha256": policy_reward_sha256,
+        "harness_contract_sha256": harness_contract_sha256,
+        "sampling_backend_contract_sha256": sampling_backend_contract_sha256,
+    }.items():
+        if not _is_sha256(value):
+            raise ValueError(f"formal plan {name} must be a SHA256 digest")
+    active_plan_sha256 = _sha256_json(dict(active_plan))
+    formal_groups = []
+    seen_uids: set[str] = set()
+    for group_index, (group, resolved) in enumerate(
+        zip(groups, resolved_selections, strict=True)
+    ):
+        if not isinstance(group, Mapping) or not isinstance(resolved, Mapping):
+            raise TypeError("formal plan groups must be objects")
+        trajectory = resolved.get("trajectory")
+        if not isinstance(trajectory, Mapping):
+            raise TypeError("formal plan resolved trajectory is missing")
+        environment_version = trajectory.get("environment_version")
+        environment_manifest_sha256 = group.get("environment_manifest_sha256")
+        if environment_version != required_environment_version:
+            raise ValueError("formal plan environment version mismatch")
+        if (
+            not _is_sha256(environment_manifest_sha256)
+            or trajectory.get("environment_manifest_sha256")
+            != environment_manifest_sha256
+        ):
+            raise ValueError("formal plan environment manifest mismatch")
+        identity = {
+            "version": NESTED_FORMAL_GROUP_IDENTITY_VERSION,
+            "source_active_group_uid": group.get("active_group_uid"),
+            "parent_branch_uid": group.get("parent_branch_uid"),
+            "replay_state_id": group.get("replay_state_id"),
+            "task_id": group.get("task_id"),
+            "actor_prompt_sha256": (group.get("actor_prompt_tokens") or {}).get(
+                "sha256"
+            ),
+            "environment_version": environment_version,
+            "environment_manifest_sha256": environment_manifest_sha256,
+            "policy_reward_sha256": policy_reward_sha256,
+            "harness_contract_sha256": harness_contract_sha256,
+            "actor_checkpoint_sha256": active_plan.get(
+                "actor_checkpoint_sha256"
+            ),
+            "decoding_config_sha256": active_plan.get("decoding_config_sha256"),
+            "sampling_backend_contract_sha256": sampling_backend_contract_sha256,
+            "source_active_branch_plan_sha256": active_plan_sha256,
+        }
+        digest_fields = (
+            "source_active_group_uid",
+            "parent_branch_uid",
+            "replay_state_id",
+            "actor_prompt_sha256",
+            "environment_manifest_sha256",
+            "actor_checkpoint_sha256",
+            "decoding_config_sha256",
+        )
+        if any(not _is_sha256(identity[name]) for name in digest_fields):
+            raise ValueError("formal plan group identity contains an invalid digest")
+        task_id = identity["task_id"]
+        if not isinstance(task_id, int) or isinstance(task_id, bool) or task_id < 0:
+            raise ValueError("formal plan task identity is invalid")
+        formal_group_uid = _sha256_json(identity)
+        if formal_group_uid in seen_uids:
+            raise ValueError("formal plan v2 group identity collision")
+        seen_uids.add(formal_group_uid)
+        formal_groups.append(
+            {
+                "group_index": group_index,
+                "formal_group_uid": formal_group_uid,
+                "source_active_group_uid": group["active_group_uid"],
+                "identity": identity,
+            }
+        )
+    return {
+        "schema_version": NESTED_FORMAL_PLAN_VERSION,
+        "source_active_branch_plan_schema_version": active_plan.get(
+            "schema_version"
+        ),
+        "source_active_branch_strategy_version": active_plan.get(
+            "strategy_version"
+        ),
+        "source_active_branch_plan_sha256": active_plan_sha256,
+        "required_environment_version": required_environment_version,
+        "policy_reward_sha256": policy_reward_sha256,
+        "harness_contract_sha256": harness_contract_sha256,
+        "sampling_backend_contract_sha256": sampling_backend_contract_sha256,
+        "groups": formal_groups,
+    }
+
+
 def _harness_boundary_snapshot(boundary: Mapping[str, object]) -> dict[str, object]:
     state = boundary.get("state")
     prompt = _integer_tokens(boundary.get("prompt_token_ids"), "post-action prompt")
@@ -354,13 +475,64 @@ class _ForcedBoundClient:
 class _ForcedDecisionCompletionClient:
     """Inject one audited decision, then delegate only downstream requests."""
 
-    def __init__(self, delegate):
+    def __init__(self, delegate, *, actor_checkpoint_attestor=None):
         self.delegate = delegate
         self.timeout = getattr(delegate, "timeout", None)
         self.context: dict[str, object] | None = None
+        self.actor_checkpoint_attestor = actor_checkpoint_attestor
+        self._delegate_binding = None
+        self._binding_contract_sha256: str | None = None
+        self.used_prehashed_actor_binding = False
+        self._actor_runtime_binding: dict[str, object] | None = None
+        self.completion_intent_observer = None
+        if actor_checkpoint_attestor is not None and not callable(
+            getattr(actor_checkpoint_attestor, "verify_runtime", None)
+        ):
+            raise TypeError("actor_checkpoint_attestor must expose verify_runtime")
+
+    def set_completion_intent_observer(self, observer) -> None:
+        if observer is not None and not callable(observer):
+            raise TypeError("completion intent observer must be callable")
+        self.completion_intent_observer = observer
 
     def attest_and_bind(self, **kwargs):
-        return _ForcedBoundClient(self, self.delegate.attest_and_bind(**kwargs))
+        actor_checkpoint = kwargs.get("actor_checkpoint")
+        actor_checkpoint_sha256 = kwargs.get("actor_checkpoint_sha256")
+        contract = {
+            name: (
+                str(value.expanduser().resolve())
+                if name == "actor_checkpoint" and hasattr(value, "expanduser")
+                else deepcopy(value)
+            )
+            for name, value in kwargs.items()
+        }
+        binding_contract_sha256 = _sha256_json(contract)
+        actor_runtime_binding = None
+        if self.actor_checkpoint_attestor is not None:
+            actor_runtime_binding = self.actor_checkpoint_attestor.verify_runtime(
+                actor_checkpoint=actor_checkpoint,
+                actor_checkpoint_sha256=actor_checkpoint_sha256,
+            )
+            self._actor_runtime_binding = deepcopy(actor_runtime_binding)
+        if self._delegate_binding is None:
+            prehashed_bind = getattr(
+                self.delegate, "attest_and_bind_prehashed", None
+            )
+            if actor_runtime_binding is not None and callable(prehashed_bind):
+                self._delegate_binding = prehashed_bind(
+                    **kwargs,
+                    actor_runtime_binding=actor_runtime_binding,
+                )
+                self.used_prehashed_actor_binding = True
+            else:
+                self._delegate_binding = self.delegate.attest_and_bind(**kwargs)
+            self._binding_contract_sha256 = binding_contract_sha256
+        elif binding_contract_sha256 != self._binding_contract_sha256:
+            raise ActiveSuffixInfrastructureError(
+                "nested completion binding changed during collection",
+                code="nested_completion_binding_drift",
+            )
+        return _ForcedBoundClient(self, self._delegate_binding)
 
     def prepare(
         self,
@@ -380,6 +552,9 @@ class _ForcedDecisionCompletionClient:
             "downstream_prompt_sha256": [],
             "boundary": None,
             "observed_boundary_summary": None,
+            "completion_calls": 0,
+            "actor_stat_checked_completion_calls": 0,
+            "completion_intent_uids": [],
         }
 
     def observe_boundary(self, boundary: Mapping[str, object]) -> None:
@@ -432,6 +607,13 @@ class _ForcedDecisionCompletionClient:
         context = self.context
         if context is None:
             raise ActiveSuffixInfrastructureError("nested completion context is not prepared")
+        if self.actor_checkpoint_attestor is not None:
+            actor_runtime_binding = self.actor_checkpoint_attestor.verify_runtime(
+                completion_request=True
+            )
+            self._actor_runtime_binding = deepcopy(actor_runtime_binding)
+            context["actor_stat_checked_completion_calls"] += 1
+        context["completion_calls"] += 1
         decision = context["decision"]
         if context["forced_calls"] == 0:
             if prompt != decision["pre_action_prompt_token_ids"]:
@@ -461,8 +643,56 @@ class _ForcedDecisionCompletionClient:
         )
         if nested_seed in context["downstream_request_seeds"]:
             raise ActiveSuffixInfrastructureError("nested request seed collision")
+        if (
+            self.actor_checkpoint_attestor is not None
+            and self.completion_intent_observer is None
+        ):
+            raise ActiveSuffixInfrastructureError(
+                "formal nested collection requires a completion intent observer",
+                code="nested_request_intent_observer_missing",
+            )
         context["downstream_request_seeds"].append(nested_seed)
-        context["downstream_prompt_sha256"].append(token_ids_sha256(prompt))
+        prompt_sha256 = token_ids_sha256(prompt)
+        context["downstream_prompt_sha256"].append(prompt_sha256)
+        if self.completion_intent_observer is not None:
+            continuation_uid = _continuation_uid(
+                decision["state_uid"],
+                decision["decision_uid"],
+                context["continuation_index"],
+            )
+            identity = {
+                "continuation_uid": continuation_uid,
+                "actor_run_uid": (self._actor_runtime_binding or {}).get(
+                    "actor_run_uid"
+                ),
+                "actor_stat_snapshot_sha256": (
+                    self._actor_runtime_binding or {}
+                ).get("stat_snapshot_sha256"),
+                "request_index": downstream_index,
+                "seed": nested_seed,
+                "prompt_sha256": prompt_sha256,
+            }
+            persisted = self.completion_intent_observer(identity)
+            expected_persisted = {
+                "schema_version": NESTED_REQUEST_INTENT_VERSION,
+                "intent_uid": _sha256_json(
+                    {"schema_version": NESTED_REQUEST_INTENT_VERSION, **identity}
+                ),
+                **identity,
+            }
+            expected_persisted["intent_sha256"] = _sha256_json(
+                expected_persisted
+            )
+            if not isinstance(persisted, Mapping) or dict(
+                persisted
+            ) != expected_persisted:
+                raise ActiveSuffixInfrastructureError(
+                    "completion intent was not durably attested",
+                    code="nested_request_intent_invalid",
+                )
+            context["completion_intent_uids"].append(
+                expected_persisted["intent_uid"]
+            )
         return delegate.complete(prompt, seed=nested_seed)
 
     def finish(self) -> dict[str, object]:
@@ -489,6 +719,19 @@ class _ForcedDecisionCompletionClient:
             "observed_boundary_summary": deepcopy(
                 context["observed_boundary_summary"]
             ),
+            "completion_calls": context["completion_calls"],
+            "actor_stat_checked_completion_calls": context[
+                "actor_stat_checked_completion_calls"
+            ],
+            "completion_intent_uids": list(
+                context["completion_intent_uids"]
+            ),
+            "actor_stat_snapshot_sha256": (
+                (self._actor_runtime_binding or {}).get("stat_snapshot_sha256")
+            ),
+            "actor_run_uid": (self._actor_runtime_binding or {}).get(
+                "actor_run_uid"
+            ),
         }
 
     def abort(self) -> dict[str, object]:
@@ -505,6 +748,19 @@ class _ForcedDecisionCompletionClient:
             "observed_boundary_summary": deepcopy(
                 context.get("observed_boundary_summary")
             ),
+            "completion_calls": context.get("completion_calls", 0),
+            "actor_stat_checked_completion_calls": context.get(
+                "actor_stat_checked_completion_calls", 0
+            ),
+            "completion_intent_uids": list(
+                context.get("completion_intent_uids") or []
+            ),
+            "actor_stat_snapshot_sha256": (
+                (self._actor_runtime_binding or {}).get("stat_snapshot_sha256")
+            ),
+            "actor_run_uid": (self._actor_runtime_binding or {}).get(
+                "actor_run_uid"
+            ),
         }
 
 
@@ -518,6 +774,8 @@ class NestedContinuationCollector:
         resolved_selections: Sequence[Mapping[str, object]],
         stage1_records: Sequence[Mapping[str, object]],
         stage1_source_sha256: str,
+        stage1_records_path: str | Path | None = None,
+        stage1_manifest_path: str | Path | None = None,
         actor_checkpoint,
         sampling_backend_contract: Mapping[str, object],
         completion_client,
@@ -531,6 +789,7 @@ class NestedContinuationCollector:
         expected_proposals: int | None = None,
         continuations_per_decision: int = FORMAL_CONTINUATIONS_PER_DECISION,
         policy_reward: object = None,
+        actor_checkpoint_attestor=None,
     ):
         if not _is_sha256(stage1_source_sha256):
             raise ValueError("stage1_source_sha256 must be a SHA256 digest")
@@ -554,7 +813,14 @@ class NestedContinuationCollector:
         # intentionally collapsed later while retaining their multiplicity.
         self.continuations_per_decision = continuations_per_decision
         self.stage1_source_sha256 = stage1_source_sha256
-        self.forced_client = _ForcedDecisionCompletionClient(completion_client)
+        if (stage1_records_path is None) != (stage1_manifest_path is None):
+            raise ValueError(
+                "Stage-1 records and completion manifest paths must be provided together"
+            )
+        self.forced_client = _ForcedDecisionCompletionClient(
+            completion_client,
+            actor_checkpoint_attestor=actor_checkpoint_attestor,
+        )
         self._lease_count = 0
 
         def counted_env_factory():
@@ -588,12 +854,37 @@ class NestedContinuationCollector:
         self.backend_sha256 = sampling_backend_contract_sha256(
             self.runner.backend_contract
         )
+        self.formal_plan = build_nested_formal_plan(
+            self.runner.plan,
+            self.runner.resolved,
+            required_environment_version=self.runner.required_environment_version,
+            policy_reward_sha256=self.runner.policy_reward_sha256,
+            harness_contract_sha256=self.harness_contract_sha256,
+            sampling_backend_contract_sha256=self.backend_sha256,
+        )
+        self.formal_plan_sha256 = _sha256_json(self.formal_plan)
+        self._formal_group_by_active_uid = {
+            group["source_active_group_uid"]: group
+            for group in self.formal_plan["groups"]
+        }
         planned_proposals = sum(
             len(group["suffixes"]) for group in self.runner.plan["groups"]
         )
         if expected_proposals is not None and expected_proposals != planned_proposals:
             raise ValueError("expected proposal count differs from the active plan")
         self.expected_proposals = planned_proposals
+        self.stage1_source_binding = self._verify_finalized_stage1_source(
+            stage1_records,
+            records_path=stage1_records_path,
+            manifest_path=stage1_manifest_path,
+        )
+        self._stage1_records_by_slot = {
+            (str(record.get("active_group_uid")), int(record.get("suffix_index"))): record
+            for record in stage1_records
+            if isinstance(record, Mapping)
+            and isinstance(record.get("suffix_index"), int)
+            and not isinstance(record.get("suffix_index"), bool)
+        }
         self._source_audit_by_state: dict[str, list[dict[str, object]]] = {}
         self._state_exclusion_reasons: dict[str, list[dict[str, object]]] = {}
         self.decisions = self._build_decision_bank(stage1_records)
@@ -601,12 +892,77 @@ class NestedContinuationCollector:
             self.runner.plan, stage1_records
         )
         if {
-            decision["state_uid"] for decision in self.decisions
+            decision["active_group_uid"] for decision in self.decisions
         } != set(self.stage1_structure["eligible_state_uids"]):
             raise ActiveSuffixInfrastructureError(
                 "nested collector and pure stage-one classifier disagree",
                 code="nested_structure_classifier_mismatch",
             )
+        if (
+            self._verified_stage1_structure is not None
+            and self.stage1_structure != self._verified_stage1_structure
+        ):
+            raise ActiveSuffixInfrastructureError(
+                "nested collector Stage-1 partition differs from its final manifest",
+                code="nested_stage1_manifest_mismatch",
+            )
+
+    def _verify_finalized_stage1_source(
+        self,
+        records: Sequence[Mapping[str, object]],
+        *,
+        records_path: str | Path | None,
+        manifest_path: str | Path | None,
+    ) -> dict[str, object] | None:
+        self._verified_stage1_structure = None
+        if records_path is None and manifest_path is None:
+            return None
+        if records_path is None or manifest_path is None:
+            raise ValueError("finalized Stage-1 source paths are incomplete")
+        verified = verify_first_decision_artifacts(
+            plan=self.runner.plan,
+            records_path=records_path,
+            manifest_path=manifest_path,
+        )
+        verified_records = verified["records"]
+        if _canonical_json(list(records)) != _canonical_json(verified_records):
+            raise ValueError("Stage-1 records differ from the finalized artifact")
+        manifest = verified["manifest"]
+        provenance = manifest.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise TypeError("finalized Stage-1 provenance must be an object")
+        expected_runtime = {
+            "actor_checkpoint_sha256": self.runner.plan[
+                "actor_checkpoint_sha256"
+            ],
+            "decoding_config_sha256": self.runner.plan["decoding_config_sha256"],
+            "sampling_backend_contract_sha256": self.backend_sha256,
+            "required_environment_version": self.runner.required_environment_version,
+            "environment_manifest_sha256s": self.runner.environment_manifest_sha256s,
+            "policy_reward_sha256": self.runner.policy_reward_sha256,
+            "tool_schema_sha256": self.runner.plan["decoding_config"][
+                "tool_schema_sha256"
+            ],
+            "harness_contract_sha256": self.harness_contract_sha256,
+        }
+        if any(provenance.get(name) != value for name, value in expected_runtime.items()):
+            raise ValueError("finalized Stage-1 runtime contract differs from Stage 2")
+        records_file_sha256 = sha256_file(records_path)
+        if (
+            records_file_sha256 != self.stage1_source_sha256
+            or manifest.get("records_file_sha256") != records_file_sha256
+            or manifest.get("record_count") != self.expected_proposals
+        ):
+            raise ValueError("finalized Stage-1 source bytes or cardinality changed")
+        binding = build_nested_stage1_source_binding(
+            manifest,
+            final_manifest_sha256=sha256_file(manifest_path),
+        )
+        self._verified_stage1_structure = deepcopy(verified["structure"])
+        return validate_nested_stage1_source_binding(
+            binding,
+            expected_records_sha256=self.stage1_source_sha256,
+        )
 
     def _record_state_exclusion(
         self,
@@ -756,18 +1112,26 @@ class NestedContinuationCollector:
                 raise ValueError("stage-one decision source is duplicated")
             seen_sources.add(source_key)
             suffix = group["suffixes"][suffix_index]
-            state_uid = group["active_group_uid"]
+            active_group_uid = group["active_group_uid"]
+            formal_group = self._formal_group_by_active_uid[active_group_uid]
+            state_uid = formal_group["formal_group_uid"]
             proposal_uid = _sha256_json(
                 {
                     "state_uid": state_uid,
                     "proposal_index": suffix_index,
                 }
             )
+            stage1_proposal_uid = _sha256_json(
+                {
+                    "state_uid": active_group_uid,
+                    "proposal_index": suffix_index,
+                }
+            )
             stage1_record_sha256 = _sha256_json(dict(record))
-            self._source_audit_by_state.setdefault(state_uid, []).append(
+            self._source_audit_by_state.setdefault(active_group_uid, []).append(
                 {
                     "proposal_index": suffix_index,
-                    "proposal_uid": proposal_uid,
+                    "proposal_uid": stage1_proposal_uid,
                     "stage1_suffix_uid": suffix["suffix_uid"],
                     "stage1_record_sha256": stage1_record_sha256,
                 }
@@ -780,9 +1144,9 @@ class NestedContinuationCollector:
                 )
             except _ProposalStructureExclusion as exc:
                 self._record_state_exclusion(
-                    state_uid,
+                    active_group_uid,
                     code=exc.code,
-                    proposal_uids=[proposal_uid],
+                    proposal_uids=[stage1_proposal_uid],
                 )
                 continue
             identities = {
@@ -869,7 +1233,9 @@ class NestedContinuationCollector:
             decision_uid = _sha256_json(decision_identity)
             identity = {
                 "decision_identity": decision_identity,
-                "active_group_uid": state_uid,
+                "formal_plan_version": NESTED_FORMAL_PLAN_VERSION,
+                "formal_plan_sha256": self.formal_plan_sha256,
+                "active_group_uid": active_group_uid,
                 "parent_branch_uid": group["parent_branch_uid"],
                 "replay_state_id": group["replay_state_id"],
                 "task_id": group["task_id"],
@@ -890,6 +1256,11 @@ class NestedContinuationCollector:
                     "active_branch_plan_sha256": self.runner.plan_sha256,
                     "resolved_selections_sha256": self.runner.resolved_sha256,
                     "stage1_source_sha256": self.stage1_source_sha256,
+                    "stage1_manifest_sha256": (
+                        self.stage1_source_binding["final_manifest_sha256"]
+                        if self.stage1_source_binding is not None
+                        else None
+                    ),
                 },
             }
             if identity["environment_version"] != self.runner.required_environment_version:
@@ -897,6 +1268,7 @@ class NestedContinuationCollector:
             source_proposal = {
                 "proposal_index": suffix_index,
                 "proposal_uid": proposal_uid,
+                "stage1_proposal_uid": stage1_proposal_uid,
                 "source_uid": _sha256_json(
                     {
                         "proposal_uid": proposal_uid,
@@ -931,15 +1303,14 @@ class NestedContinuationCollector:
                     raise ValueError("duplicate exact decision has inconsistent stable fields")
                 if existing["first_assistant_old_logprobs"] != first_logprobs:
                     self._record_state_exclusion(
-                        state_uid,
+                        active_group_uid,
                         code="duplicate_decision_old_logprobs_mismatch",
                         proposal_uids=[
-                            *existing.get("proposal_uids", []),
                             *[
-                                item["proposal_uid"]
+                                item["stage1_proposal_uid"]
                                 for item in existing["source_proposals"]
                             ],
-                            proposal_uid,
+                            stage1_proposal_uid,
                         ],
                         decision_uid=decision_uid,
                     )
@@ -953,7 +1324,7 @@ class NestedContinuationCollector:
                 "identity": identity,
                 "group_index": group_index,
                 "suffix_index": suffix_index,
-                "active_group_uid": state_uid,
+                "active_group_uid": active_group_uid,
                 "task_id": group["task_id"],
                 "pre_action_prompt_token_ids": prompt,
                 "pre_action_prompt_sha256": pre_action_prompt_sha256,
@@ -978,7 +1349,7 @@ class NestedContinuationCollector:
         decisions = [
             decision
             for decision in decisions_by_uid.values()
-            if decision["state_uid"] not in excluded_state_uids
+            if decision["active_group_uid"] not in excluded_state_uids
         ]
         decisions.sort(
             key=lambda item: (
@@ -1032,6 +1403,15 @@ class NestedContinuationCollector:
     async def _validate_decision_parsing(self) -> None:
         """Parse every frozen first turn before the first environment is leased."""
         for decision in self.decisions:
+            if (decision.get("first_action") or {}).get(
+                "tool"
+            ) == "harness_termination":
+                if not self._is_attested_harness_termination(decision):
+                    raise ActiveSuffixInfrastructureError(
+                        "nested harness termination lacks finalized Stage-1 evidence",
+                        code="nested_parser_contract_invalid",
+                    )
+                continue
             parser_error_code = None
             try:
                 calls = await self.runner._parse(decision["first_assistant_token_ids"])
@@ -1046,6 +1426,17 @@ class NestedContinuationCollector:
                     )
                     if decision["first_action"] != parallel:
                         parser_error_code = "first_decision_parallel_calls_mismatch"
+                elif str(calls[0].get("name")) not in self.runner.tool_names:
+                    unknown = canonical_replay_action(
+                        calls[0]["name"],
+                        (
+                            calls[0]["arguments"]
+                            if isinstance(calls[0].get("arguments"), Mapping)
+                            else {}
+                        ),
+                    )
+                    if decision["first_action"] != unknown:
+                        parser_error_code = "first_decision_unknown_tool_mismatch"
                 elif calls[0].get("arguments") is None:
                     malformed = canonical_replay_action(
                         "malformed_tool_arguments",
@@ -1068,13 +1459,57 @@ class NestedContinuationCollector:
                     code="nested_parser_contract_invalid",
                 )
 
+    def _is_attested_harness_termination(
+        self, decision: Mapping[str, object]
+    ) -> bool:
+        if self.stage1_source_binding is None:
+            return False
+        sources = decision.get("source_proposals")
+        if not isinstance(sources, list) or not sources:
+            return False
+        allowed_reasons = {
+            "response_length",
+            "max_assistant_turns",
+            "max_user_turns",
+        }
+        for source in sources:
+            if not isinstance(source, Mapping):
+                return False
+            suffix_index = source.get("stage1_suffix_index")
+            if not isinstance(suffix_index, int) or isinstance(suffix_index, bool):
+                return False
+            record = self._stage1_records_by_slot.get(
+                (str(decision.get("active_group_uid")), suffix_index)
+            )
+            if (
+                not isinstance(record, Mapping)
+                or record.get("stage1_proposal_version")
+                != FIRST_DECISION_PROPOSAL_VERSION
+                or record.get("collection_mode") != "first_decision_only"
+                or record.get("harness_limit_reason") not in allowed_reasons
+                or record.get("first_action_credit_eligible") is not False
+                or record.get("sampling_attempted") is not True
+                or record.get("infrastructure_invalid") is not False
+                or record.get("harness_contract_sha256")
+                != self.harness_contract_sha256
+                or record.get("first_action") != decision.get("first_action")
+                or record.get("first_action_sha256")
+                != decision.get("first_action_sha256")
+                or _sha256_json(dict(record))
+                != source.get("stage1_record_sha256")
+            ):
+                return False
+        return True
+
     def _build_exclusion_audit(self) -> dict[str, object]:
         eligible_proposal_uids = {
-            source["proposal_uid"]
+            source["stage1_proposal_uid"]
             for decision in self.decisions
             for source in decision["source_proposals"]
         }
-        eligible_state_uids = {decision["state_uid"] for decision in self.decisions}
+        eligible_state_uids = {
+            decision["active_group_uid"] for decision in self.decisions
+        }
         if (
             eligible_state_uids != set(self.stage1_structure["eligible_state_uids"])
             or eligible_proposal_uids
@@ -1089,6 +1524,19 @@ class NestedContinuationCollector:
         audit = deepcopy(self.stage1_structure["exclusion_audit"])
         _assert_no_hidden_goal(audit)
         return audit
+
+    def _validate_formal_record_request_intents(
+        self, record: Mapping[str, object]
+    ) -> None:
+        if self.forced_client.actor_checkpoint_attestor is None:
+            return
+        try:
+            _validate_record_request_intent_contract(record)
+        except (TypeError, ValueError) as exc:
+            raise ActiveSuffixInfrastructureError(
+                "formal nested record lacks exact request-intent evidence",
+                code="nested_request_intent_invalid",
+            ) from exc
 
     def _invalid_continuation(
         self,
@@ -1141,8 +1589,22 @@ class NestedContinuationCollector:
             "observed_boundary_summary": deepcopy(
                 trace.get("observed_boundary_summary")
             ),
+            "completion_calls": int(trace.get("completion_calls") or 0),
+            "actor_stat_checked_completion_calls": int(
+                trace.get("actor_stat_checked_completion_calls") or 0
+            ),
+            "completion_intent_uids": list(
+                trace.get("completion_intent_uids") or []
+            ),
+            "actor_stat_snapshot_sha256": trace.get(
+                "actor_stat_snapshot_sha256"
+            ),
+            "actor_run_uid": trace.get("actor_run_uid"),
             "downstream_request_seeds": list(
                 trace.get("downstream_request_seeds") or []
+            ),
+            "downstream_prompt_sha256": list(
+                trace.get("downstream_prompt_sha256") or []
             ),
             "strict": False,
             "policy_reward": 0.0,
@@ -1155,6 +1617,7 @@ class NestedContinuationCollector:
             "optimizer_enabled": False,
             "uses_hidden_goal": False,
         }
+        self._validate_formal_record_request_intents(record)
         return _with_rollout_content_sha256(record)
 
     def _valid_continuation(
@@ -1276,6 +1739,17 @@ class NestedContinuationCollector:
             "observed_boundary_summary": deepcopy(
                 trace.get("observed_boundary_summary")
             ),
+            "completion_calls": int(trace.get("completion_calls") or 0),
+            "actor_stat_checked_completion_calls": int(
+                trace.get("actor_stat_checked_completion_calls") or 0
+            ),
+            "completion_intent_uids": list(
+                trace.get("completion_intent_uids") or []
+            ),
+            "actor_stat_snapshot_sha256": trace.get(
+                "actor_stat_snapshot_sha256"
+            ),
+            "actor_run_uid": trace.get("actor_run_uid"),
             "replay": deepcopy(dict(replay)),
             "downstream_request_seeds": downstream_request_seeds,
             "downstream_prompt_sha256": list(trace["downstream_prompt_sha256"]),
@@ -1307,17 +1781,226 @@ class NestedContinuationCollector:
             "optimizer_enabled": False,
             "uses_hidden_goal": False,
         }
+        self._validate_formal_record_request_intents(record)
         return _with_rollout_content_sha256(record)
 
-    async def collect(self) -> dict[str, object]:
+    def expected_continuation_uids(self) -> list[str]:
+        return [
+            _continuation_uid(
+                decision["state_uid"], decision["decision_uid"], continuation_index
+            )
+            for decision in self.decisions
+            for continuation_index in range(self.continuations_per_decision)
+        ]
+
+    def set_completion_intent_observer(self, observer) -> None:
+        self.forced_client.set_completion_intent_observer(observer)
+
+    def journal_contract(
+        self, actor_runtime_binding: Mapping[str, object]
+    ) -> dict[str, object]:
+        if not isinstance(actor_runtime_binding, Mapping):
+            raise TypeError("actor runtime binding must be an object")
+        if (
+            actor_runtime_binding.get("actor_checkpoint_sha256")
+            != self.runner.plan["actor_checkpoint_sha256"]
+            or actor_runtime_binding.get("read_only_run_binding") is not True
+            or not _is_sha256(actor_runtime_binding.get("stat_snapshot_sha256"))
+        ):
+            raise ValueError("actor runtime binding does not match the nested plan")
+        experiment_uid = _sha256_json(
+            {
+                "formal_plan_sha256": self.formal_plan_sha256,
+                "stage1_source_sha256": self.stage1_source_sha256,
+                "stage1_manifest_sha256": (
+                    self.stage1_source_binding["final_manifest_sha256"]
+                    if self.stage1_source_binding is not None
+                    else None
+                ),
+                "harness_contract_sha256": self.harness_contract_sha256,
+                "continuations_per_decision": self.continuations_per_decision,
+                "fold_contract_version": NESTED_FOLD_CONTRACT_VERSION,
+            }
+        )
+        return build_nested_journal_contract(
+            experiment_uid=experiment_uid,
+            active_plan_sha256=self.runner.plan_sha256,
+            formal_plan_sha256=self.formal_plan_sha256,
+            resolved_selections_sha256=self.runner.resolved_sha256,
+            stage1_source_sha256=self.stage1_source_sha256,
+            stage1_manifest_sha256=(
+                self.stage1_source_binding["final_manifest_sha256"]
+                if self.stage1_source_binding is not None
+                else None
+            ),
+            stage1_source_finalized=self.stage1_source_binding is not None,
+            harness_contract_sha256=self.harness_contract_sha256,
+            actor_runtime_binding=actor_runtime_binding,
+            continuations_per_decision=self.continuations_per_decision,
+            expected_continuation_uids=self.expected_continuation_uids(),
+        )
+
+    def _validate_resumed_entry(
+        self,
+        decision: Mapping[str, object],
+        continuation_index: int,
+        entry: Mapping[str, object],
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
+        if not isinstance(entry, Mapping):
+            raise TypeError("resumed nested journal entry must be an object")
+        record = entry.get("record")
+        boundary = entry.get("post_action_boundary")
+        if not isinstance(record, Mapping) or (
+            boundary is not None and not isinstance(boundary, Mapping)
+        ):
+            raise TypeError("resumed nested journal payload is invalid")
+        normalized = deepcopy(dict(record))
+        expected_uid = _continuation_uid(
+            decision["state_uid"], decision["decision_uid"], continuation_index
+        )
+        expected_identity = {
+            "schema_version": NESTED_CONTINUATION_VERSION,
+            "continuation_uid": expected_uid,
+            "continuation_seed_uid": _continuation_seed_uid(
+                decision["state_uid"], continuation_index
+            ),
+            "seed_schedule_version": NESTED_SEED_SCHEDULE_VERSION,
+            "fold_contract_version": NESTED_FOLD_CONTRACT_VERSION,
+            "fold": _continuation_fold(continuation_index),
+            "state_uid": decision["state_uid"],
+            "source_proposal_uids": list(decision["proposal_uids"]),
+            "proposal_multiplicity": decision["proposal_multiplicity"],
+            "decision_uid": decision["decision_uid"],
+            "continuation_index": continuation_index,
+            "task_id": decision["task_id"],
+            "optimizer_enabled": False,
+            "uses_hidden_goal": False,
+        }
+        if any(normalized.get(name) != value for name, value in expected_identity.items()):
+            raise ActiveSuffixInfrastructureError(
+                "resumed continuation identity differs from the deterministic slot",
+                code="nested_journal_identity_drift",
+            )
+        claimed_content_sha256 = normalized.pop("rollout_content_sha256", None)
+        expected_content_sha256 = _sha256_json(
+            {
+                "version": NESTED_ROLLOUT_CONTENT_VERSION,
+                "record": normalized,
+            }
+        )
+        normalized["rollout_content_sha256"] = claimed_content_sha256
+        if claimed_content_sha256 != expected_content_sha256:
+            raise ActiveSuffixInfrastructureError(
+                "resumed continuation content SHA256 mismatch",
+                code="nested_journal_content_drift",
+            )
+        _assert_no_hidden_goal({"record": normalized, "boundary": boundary})
+        infrastructure_invalid = normalized.get("infrastructure_invalid")
+        if not isinstance(infrastructure_invalid, bool):
+            raise TypeError("resumed continuation infrastructure flag must be boolean")
+        if not infrastructure_invalid:
+            if not isinstance(boundary, Mapping):
+                raise ActiveSuffixInfrastructureError(
+                    "resumed valid continuation lacks its post-action boundary",
+                    code="nested_journal_boundary_missing",
+                )
+            observed = normalized.get("observed_boundary_summary")
+            expected_observed = {
+                "post_action_prompt_sha256": boundary.get(
+                    "post_action_prompt_sha256"
+                ),
+                "post_action_prompt_token_count": boundary.get(
+                    "post_action_prompt_token_count"
+                ),
+                "harness_snapshot_sha256": boundary.get(
+                    "harness_snapshot_sha256"
+                ),
+                "boundary_kind": (boundary.get("harness_snapshot") or {}).get(
+                    "boundary_kind"
+                ),
+                "first_action_sha256": (boundary.get("harness_snapshot") or {}).get(
+                    "first_action_sha256"
+                ),
+            }
+            if observed != expected_observed:
+                raise ActiveSuffixInfrastructureError(
+                    "resumed continuation boundary summary mismatch",
+                    code="nested_journal_boundary_drift",
+                )
+        lease_sequence = normalized.get("lease_sequence")
+        if lease_sequence is not None and (
+            not isinstance(lease_sequence, int)
+            or isinstance(lease_sequence, bool)
+            or lease_sequence < 1
+        ):
+            raise ValueError("resumed continuation lease sequence is invalid")
+        return normalized, None if boundary is None else deepcopy(dict(boundary))
+
+    async def collect(
+        self,
+        *,
+        resumed_entries: Mapping[str, Mapping[str, object]] | None = None,
+        persist_continuation=None,
+    ) -> dict[str, object]:
+        if (
+            self.forced_client.actor_checkpoint_attestor is not None
+            and self.forced_client.completion_intent_observer is None
+        ):
+            raise ActiveSuffixInfrastructureError(
+                "formal nested collection requires a completion intent observer",
+                code="nested_request_intent_observer_missing",
+            )
         await self._validate_decision_parsing()
         exclusion_audit = self._build_exclusion_audit()
+        resumed = dict(resumed_entries or {})
+        expected_uid_set = set(self.expected_continuation_uids())
+        if not set(resumed).issubset(expected_uid_set):
+            raise ValueError("nested journal contains an unexpected continuation UID")
+        if persist_continuation is not None and not callable(persist_continuation):
+            raise TypeError("persist_continuation must be callable")
+        resumed_lease_sequences = [
+            entry.get("record", {}).get("lease_sequence")
+            for entry in resumed.values()
+            if isinstance(entry, Mapping) and isinstance(entry.get("record"), Mapping)
+        ]
+        self._lease_count = max(
+            [
+                value
+                for value in resumed_lease_sequences
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            ],
+            default=0,
+        )
         continuations = []
         decision_outputs = []
+        consumed_resumed_uids: set[str] = set()
         for decision in self.decisions:
             expected_boundary = None
             decision_continuations = []
             for continuation_index in range(self.continuations_per_decision):
+                continuation_uid = _continuation_uid(
+                    decision["state_uid"],
+                    decision["decision_uid"],
+                    continuation_index,
+                )
+                if continuation_uid in resumed:
+                    record, resumed_boundary = self._validate_resumed_entry(
+                        decision,
+                        continuation_index,
+                        resumed[continuation_uid],
+                    )
+                    consumed_resumed_uids.add(continuation_uid)
+                    if not record["infrastructure_invalid"]:
+                        if expected_boundary is None:
+                            expected_boundary = deepcopy(resumed_boundary)
+                        elif resumed_boundary != expected_boundary:
+                            raise ActiveSuffixInfrastructureError(
+                                "resumed post-action boundaries differ within a decision",
+                                code="nested_journal_boundary_drift",
+                            )
+                    decision_continuations.append(record)
+                    continuations.append(record)
+                    continue
                 lease_count_before = self._lease_count
                 self.forced_client.prepare(
                     decision,
@@ -1356,6 +2039,8 @@ class NestedContinuationCollector:
                     )
                 if expected_boundary is None and not record["infrastructure_invalid"]:
                     expected_boundary = deepcopy(trace["boundary"])
+                if persist_continuation is not None:
+                    persist_continuation(record, trace.get("boundary"))
                 decision_continuations.append(record)
                 continuations.append(record)
             output = deepcopy(decision)
@@ -1371,6 +2056,9 @@ class NestedContinuationCollector:
                 item["valid_for_learning"] for item in decision_continuations
             ) and len(decision_continuations) == self.continuations_per_decision
             decision_outputs.append(output)
+
+        if consumed_resumed_uids != set(resumed):
+            raise AssertionError("not every resumed continuation UID was consumed")
 
         expected_continuations = len(self.decisions) * self.continuations_per_decision
         infrastructure_invalid = sum(
@@ -1404,14 +2092,21 @@ class NestedContinuationCollector:
             "schema_version": NESTED_COLLECTION_VERSION,
             "experiment_uid": _sha256_json(
                 {
-                    "plan_sha256": self.runner.plan_sha256,
+                    "formal_plan_sha256": self.formal_plan_sha256,
                     "stage1_source_sha256": self.stage1_source_sha256,
+                    "stage1_manifest_sha256": (
+                        self.stage1_source_binding["final_manifest_sha256"]
+                        if self.stage1_source_binding is not None
+                        else None
+                    ),
                     "harness_contract_sha256": self.harness_contract_sha256,
                     "continuations_per_decision": self.continuations_per_decision,
                     "fold_contract_version": NESTED_FOLD_CONTRACT_VERSION,
                 }
             ),
             "plan_sha256": self.runner.plan_sha256,
+            "formal_plan": self.formal_plan,
+            "formal_plan_sha256": self.formal_plan_sha256,
             "resolved_selections_sha256": self.runner.resolved_sha256,
             "stage1_source_sha256": self.stage1_source_sha256,
             "harness_contract": self.harness_contract,
@@ -1428,8 +2123,16 @@ class NestedContinuationCollector:
                     "decoding_config_sha256"
                 ],
                 "sampling_backend_contract_sha256": self.backend_sha256,
+                "active_branch_plan_schema_version": self.runner.plan[
+                    "schema_version"
+                ],
+                "active_branch_strategy_version": self.runner.plan[
+                    "strategy_version"
+                ],
+                "nested_formal_plan_version": NESTED_FORMAL_PLAN_VERSION,
                 "seed_schedule_version": NESTED_SEED_SCHEDULE_VERSION,
                 "rollout_content_version": NESTED_ROLLOUT_CONTENT_VERSION,
+                "stage1_source_binding": deepcopy(self.stage1_source_binding),
             },
             "fold_contract": {
                 "version": NESTED_FOLD_CONTRACT_VERSION,
@@ -1530,10 +2233,39 @@ class NestedContinuationCollector:
                 "gate_only_indices": list(GATE_CONTINUATION_INDICES),
                 "all_eight_refit_allowed": False,
                 "state_exclusion_no_backfill": True,
+                "finalized_stage1_source": self.stage1_source_binding is not None,
+                "actor_prehashed_backend_binding": (
+                    self.forced_client.used_prehashed_actor_binding
+                ),
+                "actor_stat_checked_before_every_completion": (
+                    self.forced_client.actor_checkpoint_attestor is not None
+                    and all(
+                        item["actor_stat_checked_completion_calls"]
+                        == item["completion_calls"]
+                        and _is_sha256(item["actor_stat_snapshot_sha256"])
+                        for item in continuations
+                    )
+                ),
+                "completion_calls": sum(
+                    item["completion_calls"] for item in continuations
+                ),
+                "actor_stat_checked_completion_calls": sum(
+                    item["actor_stat_checked_completion_calls"]
+                    for item in continuations
+                ),
                 "scale_collection_ready": False,
                 "formal_scale_blockers": [
-                    "streaming_journal_and_resume_not_implemented",
-                    "actor_attestation_rehashed_per_continuation",
+                    *(
+                        []
+                        if self.stage1_source_binding is not None
+                        else ["stage1_source_not_finalized"]
+                    ),
+                    *(
+                        []
+                        if self.forced_client.used_prehashed_actor_binding
+                        else ["actor_backend_binding_rehashed_or_unattested"]
+                    ),
+                    "collection_not_finalized_through_journal_manifest_commit",
                 ],
                 "optimizer_enabled": False,
                 "training_ready": False,

@@ -55,12 +55,14 @@ def parse_args(argv=None):
     parser.add_argument("--decisions", type=Path, required=True)
     parser.add_argument("--continuations", type=Path, required=True)
     parser.add_argument("--summary", type=Path, required=True)
+    parser.add_argument("--collection-manifest", type=Path, required=True)
     parser.add_argument("--actor-checkpoint", type=Path, required=True)
     parser.add_argument("--environment-manifest", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--input", type=Path, action="append", required=True)
     parser.add_argument("--stage1-source", type=Path, required=True)
+    parser.add_argument("--stage1-manifest", type=Path, required=True)
     parser.add_argument("--sampling-backend-contract", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args(argv)
@@ -69,13 +71,15 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     paths = {
-        "decisions": args.decisions.expanduser().resolve(),
-        "continuations": args.continuations.expanduser().resolve(),
-        "summary": args.summary.expanduser().resolve(),
+        "decisions": args.decisions.expanduser().absolute(),
+        "continuations": args.continuations.expanduser().absolute(),
+        "summary": args.summary.expanduser().absolute(),
+        "collection_manifest": args.collection_manifest.expanduser().absolute(),
         "environment_manifest": args.environment_manifest.expanduser().resolve(),
         "plan": args.plan.expanduser().resolve(),
         "selection": args.selection.expanduser().resolve(),
         "stage1": args.stage1_source.expanduser().resolve(),
+        "stage1_manifest": args.stage1_manifest.expanduser().resolve(),
         "backend": args.sampling_backend_contract.expanduser().resolve(),
     }
     input_paths = [path.expanduser().resolve() for path in args.input]
@@ -117,16 +121,20 @@ def main(argv=None) -> int:
             environment_manifest=_object(
                 paths["environment_manifest"], "environment manifest"
             ),
+            environment_manifest_path=paths["environment_manifest"],
             environment_manifest_sha256=_sha256(paths["environment_manifest"]),
             active_branch_plan=_object(paths["plan"], "active branch plan"),
             resolved_selections=resolved,
             stage1_records=_jsonl(paths["stage1"], "stage-one suffixes"),
             stage1_source_sha256=_sha256(paths["stage1"]),
+            stage1_records_path=paths["stage1"],
+            stage1_manifest=paths["stage1_manifest"],
             sampling_backend_contract=_object(paths["backend"], "sampling backend"),
             artifact_files={
                 name: paths[name]
                 for name in ("decisions", "continuations", "summary")
             },
+            collection_manifest=paths["collection_manifest"],
         )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise SystemExit(f"nested credit contract invalid: {exc}") from exc
