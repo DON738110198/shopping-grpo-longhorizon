@@ -150,6 +150,11 @@ shopping_dynamic_sampling:
   max_consecutive_skipped_updates: 10
   reward_tolerance: 1.0e-8
 
+# Capture-only is an explicit fixed-policy collection mode in the pinned veRL
+# patch. It must never be inferred from lr=0: ordinary DAPO remains the default.
+shopping_capture_only:
+  enable: false
+
 shopping_dapo:
   variant: dapo-clip-higher-pilot-v1
   clip_higher: true

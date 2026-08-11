@@ -21,7 +21,7 @@ EXPECTED_VERSIONS = {
     "swanlab": "0.9.1",
 }
 EXPECTED_TRANSFORMERS_REVISION = "7ea2320c76117e6742364808a666ef6f2fb40a67"
-PATCH_MARKER = "SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V4"
+PATCH_MARKER = "SHOPPING_GRPO_DYNAMIC_SAMPLING_PATCH_V5"
 MAX_SAFE_RESPONSE_LENGTH = 20480
 MAX_SAFE_SEQUENCE_LENGTH = 24576
 CURRENT_RUNTIME_FILES = {
@@ -309,6 +309,65 @@ def validate_dynamic_sampling(config, verl_source: Path, installed):
     )
 
 
+def validate_capture_only(config):
+    """Fail closed around the explicit fixed-policy rollout collection mode."""
+    capture_config = config.get("shopping_capture_only")
+    if capture_config is None:
+        raise SystemExit("shopping_capture_only config is required")
+    if not hasattr(capture_config, "keys"):
+        raise SystemExit("shopping_capture_only must be an object")
+    unknown_keys = sorted(set(capture_config.keys()) - {"enable"})
+    if unknown_keys:
+        raise SystemExit(
+            "shopping_capture_only contains unsupported keys: "
+            + ", ".join(unknown_keys)
+        )
+    if "enable" not in capture_config:
+        raise SystemExit("shopping_capture_only.enable must be explicit")
+    enabled = capture_config.get("enable")
+    if type(enabled) is not bool:
+        raise SystemExit("shopping_capture_only.enable must be a boolean")
+    if enabled and not bool(
+        config.get("shopping_dynamic_sampling", {}).get("enable", False)
+    ):
+        raise SystemExit(
+            "shopping_capture_only requires shopping_dynamic_sampling.enable=true "
+            "so every rollout is written to sampling_audit.jsonl"
+        )
+    if enabled:
+        trainer = config.get("trainer", {})
+        reward_model = config.get("reward_model", {})
+        test_freq = trainer.get("test_freq")
+        violations = []
+        if trainer.get("val_before_train") is not False:
+            violations.append("trainer.val_before_train=false")
+        if (
+            isinstance(test_freq, bool)
+            or not isinstance(test_freq, (int, float))
+            or test_freq > 0
+        ):
+            violations.append("trainer.test_freq<=0")
+        if trainer.get("val_only") is not False:
+            violations.append("trainer.val_only=false")
+        if reward_model.get("enable") is not False:
+            violations.append("reward_model.enable=false")
+        if violations:
+            raise SystemExit(
+                "shopping_capture_only requires " + ", ".join(violations)
+            )
+    print(
+        "shopping capture-only preflight passed: "
+        + json.dumps(
+            {
+                "enable": enabled,
+                "policy_update_path_enabled": not enabled,
+                "selection_source": "sampling_audit.jsonl" if enabled else None,
+            },
+            sort_keys=True,
+        )
+    )
+
+
 def validate_swanlab_tracking(config):
     """Validate SwanLab only when the user explicitly enables it."""
     logger_backends = list(config.trainer.get("logger", []))
@@ -487,6 +546,7 @@ def main():
         config,
         validate_actor_prompt_token_capture_config,
     )
+    validate_capture_only(config)
     validate_dynamic_sampling(config, verl_source, installed)
     validate_swanlab_tracking(config)
     install_torch_padding_fallback()

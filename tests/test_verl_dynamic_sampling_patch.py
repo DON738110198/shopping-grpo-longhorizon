@@ -100,6 +100,9 @@ class VerlPatchScriptTest(unittest.TestCase):
                 "self.checkpoint_manager.sleep_replicas()", ready
             )
             bypass = fit_source.index("apply_bypass_mode", sleep_before_training)
+            recomputed_old = fit_source.index(
+                "self._compute_old_log_prob(batch)", bypass
+            )
             reference = fit_source.index("self._compute_ref_log_prob(batch)", bypass)
             advantage = fit_source.index("batch = compute_advantage(", reference)
             update = fit_source.index("actor_output = self._update_actor(batch)", advantage)
@@ -109,7 +112,8 @@ class VerlPatchScriptTest(unittest.TestCase):
             self.assertLess(reward_filter, ready)
             self.assertLess(ready, sleep_before_training)
             self.assertLess(sleep_before_training, bypass)
-            self.assertLess(bypass, reference)
+            self.assertLess(bypass, recomputed_old)
+            self.assertLess(recomputed_old, reference)
             self.assertLess(reference, advantage)
             self.assertLess(advantage, update)
             self.assertIn(
@@ -119,11 +123,6 @@ class VerlPatchScriptTest(unittest.TestCase):
             )
             self.assertIn(
                 "if bypass_recomputing_logprobs:  # Use `rollout_log_probs`",
-                fit_source,
-            )
-            self.assertIn(
-                "else:  # Recompute old_log_probs\n"
-                "                        with marked_timer(\"old_log_prob\"",
                 fit_source,
             )
             self.assertIn("extract_shopping_group_signals", fit_source)
@@ -155,6 +154,136 @@ class VerlPatchScriptTest(unittest.TestCase):
             self.assertLess(
                 fit_source.index("SHOPPING_GRPO_DYNAMIC_SAMPLING_SKIPPED"),
                 fit_source.index("self.checkpoint_manager.sleep_replicas()", ready),
+            )
+
+    def test_capture_only_audits_then_skips_every_policy_operation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "ray_trainer.py"
+            shutil.copy2(original_source(), target)
+            result = self.run_script(target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            fit_source = target.read_text(encoding="utf-8").split(
+                "    def fit(self):", 1
+            )[1]
+            config = fit_source.index(
+                'capture_only_config = self.config.get("shopping_capture_only")'
+            )
+            config_log = fit_source.index(
+                "SHOPPING_GRPO_CAPTURE_ONLY_CONFIG", config
+            )
+            initial_validation_guard = fit_source.index(
+                "if not capture_only_enabled and self.config.trainer.get(\n"
+                '            "val_before_train", True\n'
+                "        ):"
+            )
+            initial_validation = fit_source.index(
+                "val_metrics = self._validate()", initial_validation_guard
+            )
+            bootstrap_sync = fit_source.index(
+                "self.checkpoint_manager.update_weights(self.global_steps)"
+            )
+            generation = fit_source.index("generate_sequences(combined_gen_batch)")
+            audit = fit_source.index("append_sampling_audit(", generation)
+            capture_step = fit_source.index("SHOPPING_GRPO_CAPTURE_ONLY_STEP", audit)
+            policy_guard = fit_source.index(
+                "if not capture_only_enabled:", capture_step
+            )
+            rollout_logging = fit_source.index(
+                "# Log rollout generations if enabled", policy_guard
+            )
+            periodic_validation_guard = fit_source.index(
+                "if (\n"
+                "                    not capture_only_enabled\n"
+                "                    and self.config.trainer.test_freq > 0",
+                rollout_logging,
+            )
+            periodic_validation = fit_source.index(
+                "val_metrics: dict = self._validate()", periodic_validation_guard
+            )
+            guarded_policy_source = fit_source[policy_guard:rollout_logging]
+
+            self.assertIn("trainer.val_before_train=false", fit_source[config:generation])
+            self.assertIn("trainer.test_freq<=0", fit_source[config:generation])
+            self.assertIn("trainer.val_only=false", fit_source[config:generation])
+            self.assertIn("reward_model.enable=false", fit_source[config:generation])
+            self.assertIn(
+                'if capture_only_config is None:\n'
+                '            raise ValueError("shopping_capture_only config is required")',
+                fit_source[config:generation],
+            )
+            self.assertIn(
+                'if "enable" not in capture_only_config:\n'
+                '            raise ValueError("shopping_capture_only.enable must be explicit")',
+                fit_source[config:generation],
+            )
+            self.assertLess(config, config_log)
+            self.assertLess(config, generation)
+            self.assertLess(initial_validation_guard, initial_validation)
+            self.assertLess(bootstrap_sync, generation)
+            self.assertEqual(
+                fit_source.count(
+                    "self.checkpoint_manager.update_weights(self.global_steps)"
+                ),
+                1,
+                "capture-only permits exactly one pre-generation checkpoint bootstrap sync",
+            )
+            self.assertNotIn(
+                "self.checkpoint_manager.update_weights(",
+                fit_source[generation:policy_guard],
+                "capture-only must not synchronize changed weights after rollout",
+            )
+            self.assertNotIn(
+                "optim.lr",
+                fit_source[config:generation],
+                "capture-only must never be inferred from lr=0",
+            )
+            self.assertLess(generation, audit)
+            self.assertLess(audit, capture_step)
+            self.assertLess(capture_step, policy_guard)
+            self.assertLess(periodic_validation_guard, periodic_validation)
+            self.assertEqual(fit_source.count("self._validate()"), 2)
+            for operation in (
+                "self._compute_old_log_prob(batch)",
+                "self._compute_ref_log_prob(batch)",
+                "batch = compute_advantage(",
+                "self._update_critic(batch)",
+                "self._update_actor(batch)",
+                "self._save_checkpoint()",
+                "self.checkpoint_manager.update_weights(current_step)",
+            ):
+                self.assertIn(operation, guarded_policy_source)
+                self.assertNotIn(
+                    operation,
+                    fit_source[audit:policy_guard],
+                    f"{operation} escaped the capture-only policy guard",
+                )
+            self.assertIn("self.global_steps = current_step", fit_source[audit:policy_guard])
+            self.assertIn(
+                'batch.batch["token_level_scores"] = reward_tensor',
+                fit_source[audit:policy_guard],
+            )
+            self.assertIn('"training/optimizer_updated": int(optimizer_updated)', fit_source)
+            self.assertIn('"training/capture_only": int(capture_only_enabled)', fit_source)
+            self.assertIn(
+                "dynamic_sampling_enabled and not optimizer_updated and not capture_only_enabled",
+                fit_source,
+            )
+            self.assertIn(
+                "if capture_only_enabled:\n"
+                "                            dynamic_accepted_batches.append(batch)",
+                fit_source,
+            )
+            self.assertIn(
+                "else:\n"
+                "                            remaining_prompts = dynamic_target_prompts",
+                fit_source,
+            )
+            self.assertIn(
+                "else:\n"
+                "                            print(\n"
+                '                                "SHOPPING_GRPO_DYNAMIC_SAMPLING_READY "',
+                fit_source,
             )
 
     def test_select_and_concat_keep_all_trajectory_fields_aligned(self):
