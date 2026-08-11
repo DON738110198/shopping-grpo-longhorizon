@@ -1,0 +1,42 @@
+# DAPO-derived Shopping Agent pilot.
+#
+# GRPO V2 already supplies three parts of the DAPO recipe: reward-varying
+# dynamic sampling, token-level policy-loss aggregation and no KL penalty.
+# This first pilot isolates DAPO's clipping recipe so the comparison against
+# the 25-update GRPO P0 pilot stays interpretable:
+#   1. Clip-Higher: upper PPO clip 0.20 -> 0.28, lower clip stays 0.20.
+#   2. The DAPO dual-clip ceiling is made explicit at 10.0.
+#
+# Reward standard-deviation normalization remains off. Shopping policy rewards
+# contain intentional 0.02/0.03 behavior differences; normalizing a small-
+# variance group would amplify those differences and confound this first test.
+#
+# The paper's soft overlong penalty is not copied mechanically. In this
+# multi-turn environment response length includes ShopSimulator observations,
+# so a token-count penalty would also punish environment text the Actor did not
+# generate. Existing policy-reward negatives for max_steps and context limits
+# remain active and auditable instead.
+
+defaults:
+  - grpo
+  - _self_
+
+actor_rollout_ref:
+  actor:
+    clip_ratio_low: 0.20
+    clip_ratio_high: 0.28
+    clip_ratio_c: 10.0
+    loss_agg_mode: token-mean
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: false
+  use_kl_in_reward: false
+
+shopping_dapo:
+  variant: dapo-clip-higher-pilot-v1
+  clip_higher: true
+  dynamic_sampling: true
+  token_level_policy_gradient: true
+  reward_std_normalization: false
+  soft_overlong_reward: false
