@@ -9,6 +9,7 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from scripts import collect_active_suffixes as collect_cli
+from scripts import collect_nested_continuations as nested_cli
 from scripts.materialize_active_suffix_contract import (
     materialize_contracts,
 )
@@ -36,6 +37,13 @@ from shopping_grpo.training.grpo.active_suffix import (
     sha256_actor_checkpoint,
     summarize_active_suffix_group,
     tool_schema_sha256,
+)
+from shopping_grpo.training.grpo.nested_continuation import (
+    NESTED_COLLECTION_VERSION,
+    NestedContinuationCollector,
+)
+from shopping_grpo.training.grpo.nested_structure import (
+    NESTED_STRUCTURE_EXCLUSION_REASONS,
 )
 from shopping_grpo.training.grpo.pivotal_states import (
     branch_uid,
@@ -451,10 +459,27 @@ class FakeParser:
 
     async def parse(self, token_ids, schemas):
         self.schemas = schemas
-        if token_ids == [41]:
+        if token_ids in ([41], [43]):
             return [{"name": "open_product", "arguments": {"asin": PRODUCT_ID}}]
         if token_ids == [42]:
             return [{"name": "buy_now", "arguments": {}}]
+        if token_ids == [45]:
+            return [{"name": "unknown_tool", "arguments": {"value": 1}}]
+        if token_ids == [46]:
+            return [{"name": "think", "arguments": {"reason": "inspect"}}]
+        if token_ids == [47]:
+            return [
+                {
+                    "name": "open_product",
+                    "arguments": None,
+                    "arguments_error": "invalid JSON",
+                }
+            ]
+        if token_ids == [48]:
+            return [
+                {"name": "open_product", "arguments": {"asin": PRODUCT_ID}},
+                {"name": "think", "arguments": {"reason": "inspect"}},
+            ]
         return []
 
 
@@ -522,6 +547,29 @@ class FixedLengthEncoder(FakeEncoder):
     def encode_tool_observation(self, text):
         del text
         return [90] * self.observation_length
+
+
+class AlwaysBuyClient(FakePlanBoundClient):
+    def complete(self, prompt_token_ids, *, seed):
+        self.calls += 1
+        self.seeds.append(seed)
+        return {
+            "prompt_token_ids": list(prompt_token_ids),
+            "token_ids": [42],
+            "old_logprobs": [-0.2],
+            "finish_reason": "stop",
+            "stop_reason": None,
+        }
+
+
+class DriftingToolEncoder(FakeEncoder):
+    def __init__(self):
+        self.calls = 0
+
+    def encode_tool_observation(self, text):
+        del text
+        self.calls += 1
+        return [90, self.calls]
 
 
 def with_response_prefix(resolved, response_tokens_before):
@@ -654,6 +702,34 @@ class ActiveSuffixPrimitiveTest(unittest.TestCase):
         self.assertEqual(args.vllm_timeout, 180)
         self.assertEqual(args.environment_timeout, 60)
 
+    def test_nested_collection_cli_derives_proposals_and_defaults_to_eight_forks(self):
+        args = nested_cli.parse_args(
+            [
+                "--plan",
+                "plan.json",
+                "--selection",
+                "selection.json",
+                "--input",
+                "audit.jsonl",
+                "--active-suffixes",
+                "suffixes.jsonl",
+                "--actor-checkpoint",
+                "actor",
+                "--sampling-backend-contract",
+                "backend.json",
+                "--served-model",
+                "shopping-agent",
+                "--decisions-output",
+                "decisions.jsonl",
+                "--continuations-output",
+                "continuations.jsonl",
+                "--summary-output",
+                "nested-summary.json",
+            ]
+        )
+        self.assertIsNone(args.expected_proposals)
+        self.assertEqual(args.continuations_per_decision, 8)
+
     def test_collection_cli_writes_invalid_artifacts_then_exits_nonzero(self):
         collection = {
             "schema_version": "shopping-active-suffix-collection-v1",
@@ -680,6 +756,37 @@ class ActiveSuffixPrimitiveTest(unittest.TestCase):
             self.assertEqual(raised.exception.code, 2)
             self.assertTrue(output.is_file())
             self.assertTrue(summary.is_file())
+
+    def test_nested_cli_persists_all_three_artifacts_before_nonzero_exit(self):
+        collection = {
+            "decisions": [{"decision_uid": "a" * 64}],
+            "continuations": [{"infrastructure_invalid": True}],
+            "summary": {
+                "aggregate": {"mechanical_collection_passed": False},
+            },
+        }
+
+        async def fake_run(args):
+            del args
+            return collection
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = SimpleNamespace(
+                decisions_output=root / "decisions.jsonl",
+                continuations_output=root / "continuations.jsonl",
+                summary_output=root / "summary.json",
+            )
+            with (
+                patch.object(nested_cli, "parse_args", return_value=args),
+                patch.object(nested_cli, "_run", new=fake_run),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                nested_cli.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertTrue(args.decisions_output.is_file())
+            self.assertTrue(args.continuations_output.is_file())
+            self.assertTrue(args.summary_output.is_file())
 
     def test_materializer_cli_defaults_to_repository_template(self):
         args = parse_materialize_args(
@@ -1335,6 +1442,428 @@ class ActiveSuffixRunnerTest(unittest.TestCase):
                     for record in result["records"]
                 )
             )
+
+
+class NestedContinuationCollectorTest(unittest.TestCase):
+    def _collector(
+        self,
+        root,
+        *,
+        encoder=None,
+        stage1_mutator=None,
+        continuations_per_decision=4,
+        state_count=1,
+        long_prompt=False,
+    ):
+        actor = Path(root)
+        (actor / "weights.bin").write_bytes(b"weights")
+        actor_sha = sha256_actor_checkpoint(actor)
+        decoding, backend = decoding_and_backend(actor_sha)
+        resolved = [
+            resolved_branch(
+                17 + index,
+                ([10 + index] * 23551)
+                if long_prompt
+                else [10 + index, 20 + index],
+            )
+            for index in range(state_count)
+        ]
+        plan = build_active_branch_plan(
+            resolved,
+            actor_checkpoint_sha256=actor_sha,
+            decoding_config=decoding,
+            seed=20260811,
+            suffixes_per_state=2,
+        )
+        stage1 = asyncio.run(
+            ActiveSuffixRunner(
+                plan=plan,
+                resolved_selections=resolved,
+                actor_checkpoint=actor,
+                sampling_backend_contract=backend,
+                completion_client=FakePlanBoundClient(),
+                parser=FakeParser(),
+                encoder=FakeEncoder(),
+                env_factory=FakeEnvironment,
+                expected_groups=state_count,
+                expected_suffixes_per_state=2,
+            ).collect()
+        )["records"]
+        if stage1_mutator is not None:
+            stage1 = copy.deepcopy(stage1)
+            stage1_mutator(stage1)
+        return NestedContinuationCollector(
+            plan=plan,
+            resolved_selections=resolved,
+            stage1_records=stage1,
+            stage1_source_sha256="d" * 64,
+            actor_checkpoint=actor,
+            sampling_backend_contract=backend,
+            completion_client=AlwaysBuyClient(),
+            parser=FakeParser(),
+            encoder=encoder or FakeEncoder(),
+            env_factory=FakeEnvironment,
+            tool_schemas=SHOP_TOOL_SCHEMAS,
+            required_environment_version="shopsimulator-environment-v2.1",
+            continuations_per_decision=continuations_per_decision,
+        )
+
+    def test_duplicate_exact_proposals_share_four_fresh_continuations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = self._collector(tmp)
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+
+        summary = result["summary"]
+        self.assertEqual(summary["schema_version"], NESTED_COLLECTION_VERSION)
+        self.assertEqual(summary["aggregate"]["proposals"], 2)
+        self.assertEqual(summary["aggregate"]["decisions"], 1)
+        self.assertEqual(summary["aggregate"]["continuations"], 4)
+        self.assertEqual(summary["aggregate"]["valid_decisions"], 1)
+        self.assertTrue(summary["aggregate"]["cardinality_complete"])
+        self.assertTrue(summary["aggregate"]["post_action_parity_complete"])
+        self.assertTrue(summary["aggregate"]["mechanical_collection_passed"])
+        self.assertFalse(summary["safety"]["training_ready"])
+        self.assertFalse(summary["aggregate"]["formal_fold_collection_passed"])
+        self.assertEqual(len(FakeEnvironment.instances), 4)
+        self.assertTrue(all(env.released for env in FakeEnvironment.instances))
+        self.assertTrue(all(item["strict"] for item in result["continuations"]))
+        self.assertTrue(
+            all(
+                len(item["downstream_request_seeds"]) == 1
+                and item["fresh_environment_lease"]
+                and item["release_verified"]
+                for item in result["continuations"]
+            )
+        )
+        self.assertEqual(
+            {item["lease_sequence"] for item in result["continuations"]},
+            set(range(1, 5)),
+        )
+        for decision in result["decisions"]:
+            self.assertEqual(decision["proposal_multiplicity"], 2)
+            self.assertEqual(len(decision["source_proposals"]), 2)
+            self.assertEqual(len(decision["decision_content_sha256"]), 64)
+            self.assertEqual(decision["continuations_expected"], 4)
+            self.assertEqual(len(decision["continuation_uids"]), 4)
+            self.assertTrue(decision["structurally_valid"])
+            self.assertEqual(
+                decision["post_action_boundary"]["post_action_prompt_sha256"],
+                decision["post_action_boundary"]["harness_snapshot"][
+                    "post_action_prompt_sha256"
+                ],
+            )
+            identity = decision["identity"]
+            self.assertEqual(
+                identity["environment_version"],
+                "shopsimulator-environment-v2.1",
+            )
+            for name in (
+                "environment_manifest_sha256",
+                "policy_reward_sha256",
+                "harness_contract_sha256",
+                "actor_checkpoint_sha256",
+                "decoding_config_sha256",
+                "sampling_backend_contract_sha256",
+            ):
+                self.assertEqual(len(identity[name]), 64)
+        self.assertEqual(
+            {item["fold"] for item in result["continuations"]}, {"train"}
+        )
+        self.assertTrue(
+            all(
+                len(item["continuation_seed_uid"]) == 64
+                and len(item["rollout_content_sha256"]) == 64
+                and item["first_downstream_seed"]
+                == item["downstream_request_seeds"][0]
+                for item in result["continuations"]
+            )
+        )
+        serialized = json.dumps(result)
+        self.assertNotIn("must never be serialized", serialized)
+        self.assertNotIn('"goal"', serialized)
+
+    def test_distinct_decisions_share_state_slot_crn_and_keep_gate_fold(self):
+        def make_second_decision_distinct(records):
+            records[1]["response_ids"][0] = 43
+
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = self._collector(
+                tmp,
+                stage1_mutator=make_second_decision_distinct,
+                continuations_per_decision=8,
+            )
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+
+        self.assertEqual(result["summary"]["aggregate"]["proposals"], 2)
+        self.assertEqual(result["summary"]["aggregate"]["distinct_decisions"], 2)
+        self.assertEqual(len(result["continuations"]), 16)
+        self.assertTrue(
+            result["summary"]["aggregate"]["formal_fold_collection_passed"]
+        )
+        for continuation_index in range(8):
+            slot = [
+                item
+                for item in result["continuations"]
+                if item["continuation_index"] == continuation_index
+            ]
+            self.assertEqual(len(slot), 2)
+            self.assertEqual(len({item["continuation_uid"] for item in slot}), 2)
+            self.assertEqual(len({item["continuation_seed_uid"] for item in slot}), 1)
+            self.assertEqual(
+                len({tuple(item["downstream_request_seeds"]) for item in slot}), 1
+            )
+            expected_fold = "train" if continuation_index < 4 else "gate"
+            self.assertTrue(all(item["fold"] == expected_fold for item in slot))
+
+    def test_stage_one_terminal_outcome_flags_do_not_filter_reusable_decisions(self):
+        def mark_later_trajectory_invalid(records):
+            for record in records:
+                record["valid_for_learning"] = False
+                record["infrastructure_invalid"] = True
+                record["first_action_credit_eligible"] = False
+                record["model_failure"] = True
+
+        with tempfile.TemporaryDirectory() as baseline_tmp, tempfile.TemporaryDirectory() as tmp:
+            baseline = self._collector(baseline_tmp)
+            collector = self._collector(tmp, stage1_mutator=mark_later_trajectory_invalid)
+            partition_fields = (
+                "eligible_state_uids",
+                "excluded_state_uids",
+                "eligible_proposal_uids",
+                "excluded_proposal_uids",
+            )
+            self.assertEqual(
+                {name: baseline.stage1_structure[name] for name in partition_fields},
+                {name: collector.stage1_structure[name] for name in partition_fields},
+            )
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+
+        self.assertEqual(result["summary"]["exclusion_audit"]["excluded_states"], 0)
+        self.assertEqual(result["summary"]["aggregate"]["proposals"], 2)
+        self.assertEqual(len(result["continuations"]), 4)
+
+    def test_duplicate_decision_old_logprob_mismatch_excludes_state(self):
+        def tamper(records):
+            records[1]["old_logprobs"][0] = -0.3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = self._collector(tmp, stage1_mutator=tamper)
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+
+        self.assertEqual(result["decisions"], [])
+        self.assertEqual(result["continuations"], [])
+        self.assertEqual(FakeEnvironment.instances, [])
+        audit = result["summary"]["exclusion_audit"]
+        self.assertEqual(audit["excluded_states"], 1)
+        self.assertEqual(
+            audit["reason_counts"],
+            {"duplicate_decision_old_logprobs_mismatch": 1},
+        )
+        self.assertFalse(
+            result["summary"]["aggregate"]["mechanical_collection_passed"]
+        )
+
+    def test_missing_first_span_excludes_state_and_keeps_other_state(self):
+        def tamper(records):
+            records[0]["first_action_span"] = None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = self._collector(
+                tmp, stage1_mutator=tamper, state_count=2
+            )
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+
+        audit = result["summary"]["exclusion_audit"]
+        self.assertEqual(audit["reason_counts"], {"first_decision_span_invalid": 1})
+        self.assertTrue(
+            set(audit["reason_counts"]).issubset(NESTED_STRUCTURE_EXCLUSION_REASONS)
+        )
+        self.assertEqual(audit["eligible_states"], 1)
+        self.assertEqual(audit["excluded_states"], 1)
+        self.assertEqual(len(result["continuations"]), 4)
+        self.assertEqual(len(FakeEnvironment.instances), 4)
+
+    def test_supported_first_decision_modes_replay_or_terminalize(self):
+        cases = [
+            (
+                44,
+                canonical_replay_action("assistant_final", {}),
+                "deterministic_terminal",
+            ),
+            (
+                45,
+                canonical_replay_action("unknown_tool", {"value": 1}),
+                "sampled_continuation",
+            ),
+            (
+                46,
+                canonical_replay_action("think", {"reason": "inspect"}),
+                "sampled_continuation",
+            ),
+            (
+                47,
+                canonical_replay_action(
+                    "malformed_tool_arguments", {"tool": "open_product"}
+                ),
+                "sampled_continuation",
+            ),
+            (
+                48,
+                canonical_replay_action(
+                    "parallel_tool_calls", {"tools": ["open_product", "think"]}
+                ),
+                "deterministic_terminal",
+            ),
+        ]
+        for token_id, action, expected_mode in cases:
+            with self.subTest(action=action["tool"]), tempfile.TemporaryDirectory() as tmp:
+                def mutate(records, token_id=token_id, action=action):
+                    for record in records:
+                        record["response_ids"][0] = token_id
+                        record["first_action"] = action
+                        record["first_action_sha256"] = replay_action_sha256(
+                            action["tool"], action["parameters"]
+                        )
+
+                collector = self._collector(tmp, stage1_mutator=mutate)
+                FakeEnvironment.instances = []
+                result = asyncio.run(collector.collect())
+
+            self.assertEqual(result["summary"]["exclusion_audit"]["excluded_states"], 0)
+            self.assertEqual(len(result["continuations"]), 4)
+            self.assertTrue(
+                all(
+                    item["generation_mode"] == expected_mode
+                    for item in result["continuations"]
+                )
+            )
+            if expected_mode == "deterministic_terminal":
+                self.assertTrue(
+                    all(
+                        item["downstream_request_seeds"] == []
+                        and item["first_downstream_seed"] is None
+                        and item["model_failure"]
+                        for item in result["continuations"]
+                    )
+                )
+            else:
+                self.assertTrue(
+                    all(item["downstream_request_seeds"] for item in result["continuations"])
+                )
+            self.assertTrue(
+                all(item["replay"]["verified"] for item in result["continuations"])
+            )
+            self.assertEqual(len(FakeEnvironment.instances), 4)
+            self.assertTrue(all(env.released for env in FakeEnvironment.instances))
+
+    def test_nonterminal_boundary_can_end_before_any_downstream_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = self._collector(tmp, long_prompt=True)
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+
+        self.assertEqual(len(result["continuations"]), 8)
+        self.assertTrue(
+            all(
+                item["generation_mode"] == "no_generation_terminal"
+                and item["downstream_request_seeds"] == []
+                and item["first_downstream_seed"] is None
+                and item["model_failure"]
+                and item["termination_reason"] == "context_hard_limit_exceeded"
+                and item["valid_for_learning"]
+                for item in result["continuations"]
+            )
+        )
+        self.assertTrue(
+            all(
+                decision["post_action_boundary"]["harness_snapshot"]["boundary_kind"]
+                == "continuation_required"
+                for decision in result["decisions"]
+            )
+        )
+        self.assertEqual(len(FakeEnvironment.instances), 8)
+        self.assertTrue(all(env.released for env in FakeEnvironment.instances))
+
+    def test_parser_mismatch_aborts_as_infrastructure_contract_drift(self):
+        def tamper(records):
+            records[0]["response_ids"][0] = 42
+
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = self._collector(
+                tmp, stage1_mutator=tamper, state_count=2
+            )
+            FakeEnvironment.instances = []
+            with self.assertRaisesRegex(
+                ActiveSuffixInfrastructureError,
+                "parser contract drift",
+            ):
+                asyncio.run(collector.collect())
+        self.assertEqual(FakeEnvironment.instances, [])
+        self.assertNotIn(
+            "first_decision_parse_mismatch",
+            NESTED_STRUCTURE_EXCLUSION_REASONS,
+        )
+
+    def test_hidden_goal_stage_one_input_fails_before_environment_lease(self):
+        def tamper(records):
+            records[0]["hidden_goal"] = "forbidden"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            FakeEnvironment.instances = []
+            with self.assertRaisesRegex(
+                ActiveSuffixInfrastructureError,
+                "forbidden hidden-goal field",
+            ):
+                self._collector(tmp, stage1_mutator=tamper)
+        self.assertEqual(len(FakeEnvironment.instances), 2)
+        self.assertTrue(all(env.released for env in FakeEnvironment.instances))
+
+    def test_post_action_prompt_drift_is_invalid_and_keeps_cardinality(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collector = self._collector(tmp, encoder=DriftingToolEncoder())
+            FakeEnvironment.instances = []
+            result = asyncio.run(collector.collect())
+
+        self.assertEqual(len(result["continuations"]), 4)
+        self.assertTrue(result["summary"]["aggregate"]["cardinality_complete"])
+        self.assertFalse(
+            result["summary"]["aggregate"]["mechanical_collection_passed"]
+        )
+        self.assertGreater(
+            result["summary"]["aggregate"][
+                "infrastructure_invalid_continuations"
+            ],
+            0,
+        )
+        self.assertIn(
+            "nested_boundary_parity_invalid",
+            result["summary"]["aggregate"][
+                "infrastructure_error_code_counts"
+            ],
+        )
+        drifted = [
+            item for item in result["continuations"] if item["infrastructure_invalid"]
+        ]
+        self.assertTrue(
+            all(
+                set(item["observed_boundary_summary"])
+                == {
+                    "post_action_prompt_sha256",
+                    "post_action_prompt_token_count",
+                    "harness_snapshot_sha256",
+                    "boundary_kind",
+                    "first_action_sha256",
+                }
+                for item in drifted
+            )
+        )
+        self.assertEqual(len(FakeEnvironment.instances), 4)
+        self.assertTrue(all(env.released for env in FakeEnvironment.instances))
 
 
 if __name__ == "__main__":

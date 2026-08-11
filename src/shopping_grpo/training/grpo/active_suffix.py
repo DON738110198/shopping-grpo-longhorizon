@@ -1234,6 +1234,7 @@ class ActiveSuffixRunner:
         environment_timeout_seconds: int = 60,
         expected_groups: int = 2,
         expected_suffixes_per_state: int = 4,
+        post_first_decision_observer=None,
     ):
         self.plan = json.loads(_canonical_json(dict(plan)))
         self.resolved = json.loads(_canonical_json(list(resolved_selections)))
@@ -1269,6 +1270,11 @@ class ActiveSuffixRunner:
             raise ValueError("completion client timeout differs from the runner contract")
         self.expected_groups = int(expected_groups)
         self.expected_suffixes_per_state = int(expected_suffixes_per_state)
+        if post_first_decision_observer is not None and not callable(
+            post_first_decision_observer
+        ):
+            raise TypeError("post_first_decision_observer must be callable")
+        self.post_first_decision_observer = post_first_decision_observer
         if self.expected_groups < 1 or self.expected_suffixes_per_state < 2:
             raise ValueError("active suffix expected group/K counts are invalid")
         self._validate_plan_fresh()
@@ -1541,6 +1547,25 @@ class ActiveSuffixRunner:
             assistant_turns = restored["assistant_turns"]
             user_turns = restored["user_turns"]
 
+            def observe_first_decision_boundary() -> None:
+                if len(assistant_spans) != 1 or not self.post_first_decision_observer:
+                    return
+                self.post_first_decision_observer(
+                    {
+                        "group_index": group_index,
+                        "suffix_index": suffix_index,
+                        "first_action": deepcopy(first_action),
+                        "first_action_sha256": first_action_sha,
+                        "first_action_span": deepcopy(first_action_span),
+                        "prompt_token_ids": list(prompt_ids),
+                        "response_token_count": len(response_ids),
+                        "response_tokens_before": response_tokens_before,
+                        "assistant_turns": assistant_turns,
+                        "user_turns": user_turns,
+                        "state": deepcopy(state),
+                    }
+                )
+
             while not state["terminate"]:
                 if len(state["steps"]) >= config["max_steps"]:
                     self._model_failure(state, "max_steps")
@@ -1663,6 +1688,7 @@ class ActiveSuffixRunner:
                         state["latest_observation"],
                     )
                     self._model_failure(state, "assistant_finished_without_environment_done")
+                    observe_first_decision_boundary()
                     break
                 if len(calls) > 1:
                     names = [str(call["name"]) for call in calls]
@@ -1683,6 +1709,7 @@ class ActiveSuffixRunner:
                         first_action_span = [span[0], span[1]]
                         first_action_credit_eligible = False
                     self._model_failure(state, "parallel_tool_calls")
+                    observe_first_decision_boundary()
                     break
                 call = calls[0]
                 name = str(call["name"])
@@ -1723,6 +1750,7 @@ class ActiveSuffixRunner:
                             state,
                             "assistant_finished_without_environment_done",
                         )
+                        observe_first_decision_boundary()
                         break
                     append_tool_observation(
                         response_ids,
@@ -1732,6 +1760,7 @@ class ActiveSuffixRunner:
                     )
                     prompt_ids.extend(observation_ids)
                     user_turns += 1
+                    observe_first_decision_boundary()
                     continue
                 if parameters is None:
                     action = canonical_replay_action("malformed_tool_arguments", {"tool": name})
@@ -1760,6 +1789,7 @@ class ActiveSuffixRunner:
                             state,
                             "assistant_finished_without_environment_done",
                         )
+                        observe_first_decision_boundary()
                         break
                     append_tool_observation(
                         response_ids,
@@ -1769,6 +1799,7 @@ class ActiveSuffixRunner:
                     )
                     prompt_ids.extend(observation_ids)
                     user_turns += 1
+                    observe_first_decision_boundary()
                     continue
                 parameters = dict(parameters)
                 action = canonical_replay_action(name, parameters)
@@ -1922,6 +1953,7 @@ class ActiveSuffixRunner:
                 )
                 prompt_ids.extend(observation_ids)
                 user_turns += 1
+                observe_first_decision_boundary()
 
             if len(response_ids) > suffix_response_budget:
                 response_truncated = True
