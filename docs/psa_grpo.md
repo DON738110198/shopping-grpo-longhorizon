@@ -308,3 +308,55 @@ Reward 计算和 outcome-blind exclusion 后，才可能放行 optimizer。正�
 通过。未达到门槛时保留全部工件，但不进行参数更新。
 
 在这些门槛通过前，报告中的 `training_ready` 固定为 `false`，也不运行 Final-200。
+
+## Capture-only 真实验证
+
+固定提交 `b1abb76` 上的一步 capture-only smoke 已在 GPU 1 完成：
+
+```text
+outputs/experiments/psa_grpo/psa_capture_only_smoke_sft_seed3407_1u_20260811_v2/
+```
+
+本次实际生成 `2 groups / 8 trajectories`，记录了 `98 / 98` 个精确 actor
+prompt token capture。训练日志明确记录 `training/capture_only=1` 和
+`training/optimizer_updated=0`，且没有产生 checkpoint、old/ref logprob、advantage 或
+actor update 工件。这证明固定策略采集已不再借助 `lr=0` 模拟，而是从
+Trainer 中真正断开了优化路径。
+
+八条中有一条提前结束的模型负样本，Reward、prompt capture 和 replay 完整，
+但末尾工具回合缺少 observation，因此 `turn_span_valid=false`。该轨迹仍作为轨迹
+级负样本审计，但其 decision 不会进入局部 credit；不会为了满足样本数而补采。
+
+## Nested 2 x 4 x 8 结果
+
+在同一提交上，对已审计的两个 pivotal state 运行了真实 vLLM +
+ShopSimulator nested mechanical smoke：
+
+```text
+outputs/experiments/psa_grpo/nested_suffix_smoke_sft_seed20260811_2x4x8_v1/
+```
+
+| 检查项 | 结果 |
+| --- | ---: |
+| state / Stage-1 proposal | 2 / 8 |
+| distinct exact decision | 8 |
+| continuation cardinality | 8 x 8 = 64 / 64 |
+| fresh lease / verified release | 64 / 64 |
+| post-action prompt + Harness parity | 64 / 64 |
+| learning-valid continuation | 64 / 64 |
+| infrastructure / reward invalid | 0 / 64 |
+| strict success（仅诊断） | 45 / 64 |
+| model failure（保留负奖励） | 7 / 64 |
+
+Collector 的 cardinality、post-action parity、fresh lease 和 train/gate fold 检查全部通过。
+Estimator 也完成了 artifact attestation，但按预注册门槛正确输出
+`structural_ready=false`、`signal_ready=false`、`training_ready=false` 和
+`optimizer_unlock_allowed=false`：当前只有 2 个 task/state，距离 32 个独立
+task/state 及 ESS 门槛还很远。
+
+另外 `scale_collection_ready=false` 仍是有意的阻断：当前 collector 没有可恢复的流式
+journal，且会对每条 continuation 重新计算 actor tree hash。在这两项改为可中断
+恢复的原子提交和起止完整 attestation 前，不启动 32-state 正式采集。
+
+Gate fold 上当前观察到的 held-out delta 仅来自 1 个可识别 state，不具备统计
+意义，不作为涨点证据。本轮没有调用 optimizer，没有评测 Final-200。
