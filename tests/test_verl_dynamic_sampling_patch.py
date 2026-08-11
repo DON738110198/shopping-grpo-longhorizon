@@ -206,7 +206,17 @@ class VerlPatchScriptTest(unittest.TestCase):
             self.assertIn("trainer.val_before_train=false", fit_source[config:generation])
             self.assertIn("trainer.test_freq<=0", fit_source[config:generation])
             self.assertIn("trainer.val_only=false", fit_source[config:generation])
-            self.assertIn("reward_model.enable=false", fit_source[config:generation])
+            self.assertIn(
+                "reward.reward_model.enable=false", fit_source[config:generation]
+            )
+            self.assertIn(
+                'reward_config = self.config.get("reward")',
+                fit_source[config:generation],
+            )
+            self.assertNotIn(
+                "self.config.reward_model",
+                fit_source[config:generation],
+            )
             self.assertIn(
                 'if capture_only_config is None:\n'
                 '            raise ValueError("shopping_capture_only config is required")',

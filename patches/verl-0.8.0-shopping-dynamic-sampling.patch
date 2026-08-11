@@ -103,7 +103,7 @@ index d1eaa7b..42bb982 100644
 
      def init_workers(self):
          """Initialize distributed training workers using Ray backend.
-@@ -1380,9 +1407,130 @@ class RayPPOTrainer:
+@@ -1380,9 +1407,142 @@ class RayPPOTrainer:
              config=OmegaConf.to_container(self.config, resolve=True),
          )
 
@@ -149,8 +149,20 @@ index d1eaa7b..42bb982 100644
 +                capture_only_violations.append("trainer.test_freq<=0")
 +            if self.config.trainer.get("val_only") is not False:
 +                capture_only_violations.append("trainer.val_only=false")
-+            if self.config.reward_model.get("enable") is not False:
-+                capture_only_violations.append("reward_model.enable=false")
++            # main_ppo migrates the legacy top-level reward_model block into
++            # reward.reward_model and then deletes the legacy key before fit().
++            reward_config = self.config.get("reward")
++            reward_model_config = (
++                reward_config.get("reward_model")
++                if hasattr(reward_config, "get")
++                else None
++            )
++            if (
++                not hasattr(reward_model_config, "get")
++                or "enable" not in reward_model_config
++                or reward_model_config.get("enable") is not False
++            ):
++                capture_only_violations.append("reward.reward_model.enable=false")
 +            if capture_only_violations:
 +                raise ValueError(
 +                    "shopping_capture_only requires "

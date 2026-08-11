@@ -38,7 +38,7 @@ class DynamicSamplingConfigTest(unittest.TestCase):
                     "test_freq": -1,
                     "val_only": False,
                 },
-                "reward_model": {"enable": False},
+                "reward": {"reward_model": {"enable": False}},
             }
         )
 
@@ -47,12 +47,12 @@ class DynamicSamplingConfigTest(unittest.TestCase):
                 {
                     "shopping_capture_only": {"enable": True},
                     "shopping_dynamic_sampling": {"enable": False},
-                    "trainer": {
-                        "val_before_train": False,
-                        "test_freq": -1,
-                        "val_only": False,
-                    },
-                    "reward_model": {"enable": False},
+                        "trainer": {
+                            "val_before_train": False,
+                            "test_freq": -1,
+                            "val_only": False,
+                        },
+                        "reward": {"reward_model": {"enable": False}},
                 }
             )
 
@@ -97,14 +97,14 @@ class DynamicSamplingConfigTest(unittest.TestCase):
                 "test_freq": -1,
                 "val_only": False,
             },
-            "reward_model": {"enable": False},
+            "reward": {"reward_model": {"enable": False}},
         }
         cases = (
             ("trainer.val_before_train=false", "trainer", "val_before_train", True),
             ("trainer.test_freq<=0", "trainer", "test_freq", 1),
             ("trainer.test_freq<=0", "trainer", "test_freq", "disabled"),
             ("trainer.val_only=false", "trainer", "val_only", True),
-            ("reward_model.enable=false", "reward_model", "enable", True),
+            ("reward.reward_model.enable=false", "reward", "reward_model", {"enable": True}),
         )
         for expected, section, key, value in cases:
             with self.subTest(expected=expected, value=value):
@@ -119,7 +119,7 @@ class DynamicSamplingConfigTest(unittest.TestCase):
             ("trainer.val_before_train=false", "trainer", "val_before_train"),
             ("trainer.test_freq<=0", "trainer", "test_freq"),
             ("trainer.val_only=false", "trainer", "val_only"),
-            ("reward_model.enable=false", "reward_model", "enable"),
+            ("reward.reward_model.enable=false", "reward", "reward_model"),
         ):
             with self.subTest(expected=expected, missing=key):
                 config = {
@@ -129,6 +129,43 @@ class DynamicSamplingConfigTest(unittest.TestCase):
                 del config[section][key]
                 with self.assertRaisesRegex(SystemExit, expected):
                     validate_capture_only(config)
+
+        legacy_override = {
+            name: dict(payload) if isinstance(payload, dict) else payload
+            for name, payload in base.items()
+        }
+        legacy_override["reward_model"] = {"enable": True}
+        with self.assertRaisesRegex(
+            SystemExit, "reward.reward_model.enable=false"
+        ):
+            validate_capture_only(legacy_override)
+
+    def test_real_hydra_config_survives_reward_migration_and_fails_closed(self):
+        config = compose_runtime_config(
+            [
+                "shopping_capture_only.enable=true",
+                "trainer.val_before_train=false",
+                "trainer.test_freq=-1",
+                "trainer.val_only=false",
+                "reward_model.enable=false",
+            ]
+        )
+        validate_capture_only(config)
+
+        from omegaconf import open_dict
+        from verl.experimental.reward_loop import migrate_legacy_reward_impl
+
+        migrated = migrate_legacy_reward_impl(config)
+        self.assertNotIn("reward_model", migrated)
+        self.assertIs(migrated.reward.reward_model.enable, False)
+        validate_capture_only(migrated)
+
+        with open_dict(migrated.reward.reward_model):
+            del migrated.reward.reward_model["enable"]
+        with self.assertRaisesRegex(
+            SystemExit, "reward.reward_model.enable=false"
+        ):
+            validate_capture_only(migrated)
 
     def test_training_memory_budget_enforces_real_micro_batch_one(self):
         config = compose_runtime_config([])

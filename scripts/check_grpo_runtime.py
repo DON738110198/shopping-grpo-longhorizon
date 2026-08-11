@@ -336,7 +336,6 @@ def validate_capture_only(config):
         )
     if enabled:
         trainer = config.get("trainer", {})
-        reward_model = config.get("reward_model", {})
         test_freq = trainer.get("test_freq")
         violations = []
         if trainer.get("val_before_train") is not False:
@@ -349,8 +348,28 @@ def validate_capture_only(config):
             violations.append("trainer.test_freq<=0")
         if trainer.get("val_only") is not False:
             violations.append("trainer.val_only=false")
-        if reward_model.get("enable") is not False:
-            violations.append("reward_model.enable=false")
+        reward_config = config.get("reward")
+        reward_model = (
+            reward_config.get("reward_model")
+            if hasattr(reward_config, "get")
+            else None
+        )
+        reward_model_enable = (
+            reward_model.get("enable")
+            if hasattr(reward_model, "get") and "enable" in reward_model
+            else None
+        )
+        # main_ppo applies a non-null legacy override before deleting this key.
+        legacy_reward_model = config.get("reward_model")
+        if legacy_reward_model is not None:
+            if not hasattr(legacy_reward_model, "get"):
+                reward_model_enable = None
+            else:
+                legacy_enable = legacy_reward_model.get("enable")
+                if legacy_enable is not None:
+                    reward_model_enable = legacy_enable
+        if reward_model_enable is not False:
+            violations.append("reward.reward_model.enable=false")
         if violations:
             raise SystemExit(
                 "shopping_capture_only requires " + ", ".join(violations)
