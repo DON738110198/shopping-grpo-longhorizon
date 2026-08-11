@@ -37,6 +37,7 @@ class EnvironmentManifestTest(unittest.TestCase):
             "reward": {"version": "shopsimulator-reward-v3"},
             "observation_version": "shopping-observation-v2",
             "tool_version": "shopping-tools-v2",
+            "lease_contract": "tokenized-ttl-release-v2",
             "max_steps": 35,
             "seed": 20260726,
         }
@@ -59,6 +60,7 @@ class EnvironmentManifestTest(unittest.TestCase):
             "reward": {"version": "shopsimulator-reward-v3"},
             "observation_version": "shopping-observation-v2",
             "tool_version": "shopping-tools-v2",
+            "lease_contract": "tokenized-ttl-release-v2",
             "max_steps": 35,
             "seed": 20260726,
         }
@@ -79,10 +81,31 @@ class EnvironmentManifestTest(unittest.TestCase):
             "reward": {"version": "shopsimulator-reward-v3"},
             "observation_version": "shopping-observation-v2",
             "tool_version": "unsupported-tools",
+            "lease_contract": "tokenized-ttl-release-v2",
             "max_steps": 35,
             "seed": 20260726,
         }
         with self.assertRaisesRegex(ValueError, "Tool v2"):
+            validate_manifest(manifest)
+
+    def test_legacy_index_only_lease_contract_is_rejected(self):
+        manifest = {
+            "manifest_version": MANIFEST_VERSION,
+            "shopsimulator_commit": "a" * 40,
+            "product_data_sha256": "c" * 64,
+            "search": {
+                "version": "shopsimulator-multifield-bm25-v2",
+                "page_size": 20,
+            },
+            "reward": {"version": "shopsimulator-reward-v3"},
+            "observation_version": "shopping-observation-v2",
+            "tool_version": "shopping-tools-v2",
+            "lease_contract": "explicit-client-release-v1",
+            "max_steps": 35,
+            "seed": 20260726,
+        }
+
+        with self.assertRaisesRegex(ValueError, "tokenized-ttl-release-v2"):
             validate_manifest(manifest)
 
     def test_embedded_shopsimulator_commit_is_read_without_nested_git(self):

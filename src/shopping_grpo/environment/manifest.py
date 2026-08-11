@@ -6,8 +6,8 @@ import hashlib
 import json
 from pathlib import Path
 
-
 MANIFEST_VERSION = "shopping-environment-manifest-v1"
+LEASE_CONTRACT = "tokenized-ttl-release-v2"
 EMBEDDED_SOURCE_FILE = "EMBEDDED_SOURCE.json"
 REQUIRED_KEYS = {
     "manifest_version",
@@ -17,6 +17,7 @@ REQUIRED_KEYS = {
     "reward",
     "observation_version",
     "tool_version",
+    "lease_contract",
     "max_steps",
     "seed",
 }
@@ -63,6 +64,8 @@ def validate_manifest(manifest):
         raise ValueError("manifest does not select Observation v2")
     if manifest["tool_version"] != "shopping-tools-v2":
         raise ValueError("manifest does not select Tool v2")
+    if manifest["lease_contract"] != LEASE_CONTRACT:
+        raise ValueError(f"manifest does not select {LEASE_CONTRACT}")
     environment_version = manifest.get(
         "environment_version",
         "shopsimulator-environment-v2.1",

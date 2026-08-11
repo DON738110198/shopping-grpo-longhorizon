@@ -1,6 +1,6 @@
 {
   "environment_version": "shopsimulator-environment-v2.1",
-  "lease_contract": "explicit-client-release-v1",
+  "lease_contract": "tokenized-ttl-release-v2",
   "manifest_version": "shopping-environment-manifest-v1",
   "max_steps": 35,
   "observation_version": "shopping-observation-v2",
@@ -36,9 +36,9 @@
   "seed": 20260728,
   "runtime_files_sha256": {
     "observation.py": "adabdf0109b8a0f592148c098e44065913ce6c699230047239d8809f412bf998",
-    "pack_api.py": "ced5ed6aec64d617cf4bab878732cb602a325dc64ba58051766e597e8301cff3",
+    "pack_api.py": "6be653251c5031acf2930c233d3ebb36fbb28d1302ae10d08e8a6e4a1c186aa7",
     "reward.py": "ea692a5bd91c95dc086925372667e74328c0f86b3d6f1c67df3c59883df8990e",
-    "slot_lease_pool.py": "5be40275eebbed6735196a1dea4581ce707558e247d23d0de4d98907772a0420",
+    "slot_lease_pool.py": "a97e94b6d56af62d7b67c0cc50559df07f70cc61e75a7b03bfd1dbf4c8d03e11",
     "web_agent_text_env.py": "d6db15f282849847a364d8d36af0eed113c1c97184a1ded98eb1fd29dab577d1"
   },
   "shopsimulator_commit": "9ecba272963960ab4a10e1a781bd05cd7634ce20",

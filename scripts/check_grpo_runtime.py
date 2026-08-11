@@ -34,9 +34,9 @@ CURRENT_RUNTIME_FILES = {
 
 
 def validate_reward_runtime_files(manifest, root):
-    if manifest.get("lease_contract") != "explicit-client-release-v1":
+    if manifest.get("lease_contract") != "tokenized-ttl-release-v2":
         raise SystemExit(
-            "Environment v2.1 manifest must select explicit-client-release-v1"
+            "Environment v2.1 manifest must select tokenized-ttl-release-v2"
         )
     expected = manifest.get("runtime_files_sha256")
     if not isinstance(expected, dict) or set(expected) != set(CURRENT_RUNTIME_FILES):
