@@ -895,6 +895,51 @@ class NestedCollectionAdapterTests(unittest.TestCase):
         self.assertFalse(affected["structural_gate"]["eligible_for_credit"])
         self.assertEqual(affected["decision_values"], [])
 
+    def test_attested_boundary_failure_is_excluded_from_q_not_rejected(self) -> None:
+        class BoundaryInvalidEnvironment(FakeEnvironment):
+            def step(self, action):
+                if (
+                    self.task_id == 17
+                    and action.startswith("click[")
+                    and action != "click[Buy Now]"
+                ):
+                    raise AssertionError("forced action is unavailable")
+                return super().step(action)
+
+        resolved = [resolved_branch(task_id, [10, 20]) for task_id in range(17, 38)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collection, plan, resolved, stage1, backend = self._artifacts(
+                root,
+                resolved_rows=resolved,
+                continuations_per_decision=8,
+                env_factory=BoundaryInvalidEnvironment,
+            )
+            self.assertTrue(
+                any(
+                    decision["post_action_boundary"] is None
+                    for decision in collection["decisions"]
+                )
+            )
+            report = self._estimate(
+                collection, root, plan, resolved, stage1, backend
+            )
+
+        self.assertTrue(report["source_attestation"]["attested"])
+        self.assertGreater(
+            report["training_gate"]["observed"][
+                "infrastructure_invalid_continuations"
+            ],
+            0,
+        )
+        affected = next(
+            state
+            for state in report["states"]
+            if state["infrastructure_invalid_continuations"]
+        )
+        self.assertFalse(affected["structural_gate"]["eligible_for_credit"])
+        self.assertEqual(affected["decision_values"], [])
+
     def test_exclusion_audit_is_recomputed_not_trusted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

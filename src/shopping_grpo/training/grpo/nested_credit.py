@@ -2264,49 +2264,65 @@ def estimate_nested_collection_credit(
             raise ValueError("nested decision proposal multiplicity mismatch")
 
         boundary = raw_decision.get("post_action_boundary")
-        if not isinstance(boundary, Mapping):
-            raise TypeError("nested decision has no post-action boundary")
-        boundary_prompt = boundary.get("post_action_prompt_token_ids")
-        snapshot = boundary.get("harness_snapshot")
-        if (
-            not isinstance(boundary_prompt, list)
-            or not boundary_prompt
-            or boundary.get("post_action_prompt_sha256")
-            != token_ids_sha256(boundary_prompt)
-            or boundary.get("post_action_prompt_token_count") != len(boundary_prompt)
-            or not isinstance(snapshot, Mapping)
-            or boundary.get("harness_snapshot_sha256") != _sha256_json(dict(snapshot))
-            or snapshot.get("first_action_sha256") != action_sha
-            or snapshot.get("first_action_span") != [0, len(first_tokens)]
-            or snapshot.get("task_id") != task_id
-            or snapshot.get("post_action_prompt_sha256")
-            != boundary["post_action_prompt_sha256"]
-            or snapshot.get("post_action_prompt_token_count") != len(boundary_prompt)
-        ):
-            raise ValueError("nested post-action prompt or harness snapshot mismatch")
-        boundary_kind = snapshot.get("boundary_kind")
-        boundary_done = snapshot.get("done")
-        boundary_terminate = snapshot.get("terminate")
-        termination_reason = snapshot.get("termination_reason")
-        if boundary_kind == "continuation_required":
+        boundary_prompt = None
+        boundary_kind = None
+        if boundary is None:
             if (
-                boundary_done is not False
-                or boundary_terminate is not False
-                or termination_reason is not None
+                raw_decision.get("structurally_valid") is not False
+                or raw_decision.get("credit_eligible") is not False
             ):
-                raise ValueError("continuation-required boundary has terminal evidence")
-        elif boundary_kind == "deterministic_terminal":
+                raise ValueError(
+                    "nested decision without a boundary must be structurally invalid"
+                )
+        elif isinstance(boundary, Mapping):
+            boundary_prompt = boundary.get("post_action_prompt_token_ids")
+            snapshot = boundary.get("harness_snapshot")
             if (
-                not isinstance(boundary_done, bool)
-                or not isinstance(boundary_terminate, bool)
-                or not (boundary_done or boundary_terminate)
-                or (boundary_done and not boundary_terminate)
-                or not isinstance(termination_reason, str)
-                or not termination_reason
+                not isinstance(boundary_prompt, list)
+                or not boundary_prompt
+                or boundary.get("post_action_prompt_sha256")
+                != token_ids_sha256(boundary_prompt)
+                or boundary.get("post_action_prompt_token_count") != len(boundary_prompt)
+                or not isinstance(snapshot, Mapping)
+                or boundary.get("harness_snapshot_sha256")
+                != _sha256_json(dict(snapshot))
+                or snapshot.get("first_action_sha256") != action_sha
+                or snapshot.get("first_action_span") != [0, len(first_tokens)]
+                or snapshot.get("task_id") != task_id
+                or snapshot.get("post_action_prompt_sha256")
+                != boundary["post_action_prompt_sha256"]
+                or snapshot.get("post_action_prompt_token_count") != len(boundary_prompt)
             ):
-                raise ValueError("deterministic terminal boundary evidence is invalid")
+                raise ValueError("nested post-action prompt or harness snapshot mismatch")
+            boundary_kind = snapshot.get("boundary_kind")
+            boundary_done = snapshot.get("done")
+            boundary_terminate = snapshot.get("terminate")
+            termination_reason = snapshot.get("termination_reason")
+            if boundary_kind == "continuation_required":
+                if (
+                    boundary_done is not False
+                    or boundary_terminate is not False
+                    or termination_reason is not None
+                ):
+                    raise ValueError(
+                        "continuation-required boundary has terminal evidence"
+                    )
+            elif boundary_kind == "deterministic_terminal":
+                if (
+                    not isinstance(boundary_done, bool)
+                    or not isinstance(boundary_terminate, bool)
+                    or not (boundary_done or boundary_terminate)
+                    or (boundary_done and not boundary_terminate)
+                    or not isinstance(termination_reason, str)
+                    or not termination_reason
+                ):
+                    raise ValueError(
+                        "deterministic terminal boundary evidence is invalid"
+                    )
+            else:
+                raise ValueError("nested boundary kind is invalid")
         else:
-            raise ValueError("nested boundary kind is invalid")
+            raise TypeError("nested post-action boundary must be an object or null")
 
         raw_decision_continuations = continuations_by_decision.pop(decision_uid, [])
         raw_decision_continuations.sort(key=lambda item: item.get("continuation_index", -1))
@@ -2409,7 +2425,8 @@ def estimate_nested_collection_credit(
                 seen_lease_sequences.add(lease_sequence)
             if not infrastructure_invalid:
                 if (
-                    generation_mode == "infrastructure_invalid"
+                    not isinstance(boundary, Mapping)
+                    or generation_mode == "infrastructure_invalid"
                     or (
                         generation_mode == "sampled_continuation"
                         and (not seeds or boundary_kind != "continuation_required")
