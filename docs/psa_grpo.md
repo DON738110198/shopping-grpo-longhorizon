@@ -360,3 +360,52 @@ journal，且会对每条 continuation 重新计算 actor tree hash。在这两�
 
 Gate fold 上当前观察到的 held-out delta 仅来自 1 个可识别 state，不具备统计
 意义，不作为涨点证据。本轮没有调用 optimizer，没有评测 Final-200。
+
+## Formal N80 Nested PSA 结果
+
+固定提交 `ebef15d` 采集正式 N80 数据，并在 `3740811` 修复 estimator 对已审计
+null-boundary infrastructure-invalid decision 的排除路径后，对原始不可变 artifact 重新估计：
+
+```text
+outputs/experiments/psa_grpo/formal_nested_n80_seed20260811_20260812_v1/
+```
+
+| 检查项 | 结果 |
+| --- | ---: |
+| fixed-policy tasks / rollouts | 80 / 320 |
+| exact prompt captures | 4,339 / 4,339 |
+| Stage-1 states / proposals | 80 / 320 |
+| distinct exact decisions | 266 |
+| nested continuations | 2,128 / 2,128 |
+| train / gate fold | 1,064 / 1,064 |
+| sampling-invalid | 24 / 2,128 (1.13%) |
+| structural-eligible states / tasks | 65 / 65 |
+| train-ranking identifiable states / tasks | 40 / 40 |
+| optimizer updates / checkpoints | 0 / 0 |
+
+采集与来源证明全部通过：Stage 1 没有读取 terminal outcome，也没有环境租约；Stage 2
+的 journal、request intent、actor start/end hash、fresh lease、release、三份输出及 final
+manifest 均通过独立逐字节复算。9 条 infrastructure-invalid 来自两个无法重建
+post-action boundary 的 decision，15 条 reward-invalid 为 `reward_unverifiable`；这些 decision
+或 state 被完整排除，未补采，也未进入 Q/advantage。
+
+工程门槛通过，但预注册 signal gate **未通过**：
+
+| Signal gate | 观测值 | 门槛 |
+| --- | ---: | ---: |
+| high-kappa state rate | 29.23% | >= 30% |
+| gate-fold top-bottom mean delta | +0.0314 | >= +0.10 |
+| split-half ranking consistency | 57.5% | >= 60% |
+| mean-delta bootstrap 95% CI | [-0.119, +0.183] | lower > 0 |
+| consistency bootstrap 95% CI | [42.5%, 72.5%] | lower > 50% |
+| task-cluster permutation p | 0.347 | observed > null p95 |
+
+因此最终为 `structural_ready=true`、`signal_ready=false`、`training_ready=false`、
+`optimizer_unlock_allowed=false`。这说明当前 outcome-blind pivotal selector 选择的首 decision
+在独立 continuation 上没有稳定、足够大的因果排序信号；不能把训练半折的局部差异直接当成
+可学习 credit。按预注册规则，本轮不调用 optimizer，也不评测 Final-200。
+
+按标签做的事后诊断同样只用于提出下一轮假设：`candidate_open` 覆盖 64 个 eligible state，
+但 held-out mean delta 仅 `+0.0429`；11 个 `pre_commit` state 没有可识别的 decision 排序。
+后续若继续，应在新的独立任务上预注册更接近真实分叉点的公开状态，例如搜索页上的 query/open
+决策，而不是根据本轮 outcome 挑选通过的 state 或放宽统计门槛。
