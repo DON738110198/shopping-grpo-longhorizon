@@ -8,7 +8,11 @@ import hashlib
 import json
 from pathlib import Path
 
-from shopping_grpo.training.grpo.selection import select_pivotal_states
+from shopping_grpo.training.grpo.selection import (
+    PIVOTAL_SELECTION_STRATEGY,
+    SEARCH_DECISION_SELECTION_STRATEGY,
+    select_pivotal_states,
+)
 
 
 def parse_args():
@@ -17,6 +21,18 @@ def parse_args():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--max-states", type=int, default=100)
+    parser.add_argument(
+        "--strategy",
+        choices=(PIVOTAL_SELECTION_STRATEGY, SEARCH_DECISION_SELECTION_STRATEGY),
+        default=PIVOTAL_SELECTION_STRATEGY,
+    )
+    parser.add_argument("--search-query-states", type=int)
+    parser.add_argument("--search-open-states", type=int)
+    parser.add_argument(
+        "--exclude-task-ids",
+        type=Path,
+        help="JSON list of task ids excluded from a fresh confirmatory selection",
+    )
     parser.add_argument(
         "--require-prompt-capture",
         action="store_true",
@@ -48,6 +64,32 @@ def main():
     for path in paths:
         if not path.is_file():
             raise SystemExit(f"sampling audit does not exist: {path}")
+    excluded_task_ids = []
+    if args.exclude_task_ids is not None:
+        exclusion_path = args.exclude_task_ids.expanduser().resolve()
+        try:
+            excluded_task_ids = json.loads(exclusion_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"cannot read excluded task ids: {exc}") from exc
+        if not isinstance(excluded_task_ids, list):
+            raise SystemExit("excluded task ids must be a JSON list")
+    label_quotas = None
+    if args.strategy == SEARCH_DECISION_SELECTION_STRATEGY:
+        if args.search_query_states is None or args.search_open_states is None:
+            raise SystemExit(
+                "search-decision strategy requires --search-query-states and "
+                "--search-open-states"
+            )
+        label_quotas = {
+            "search_query_decision": args.search_query_states,
+            "search_result_open_decision": args.search_open_states,
+        }
+    elif (
+        args.search_query_states is not None
+        or args.search_open_states is not None
+        or excluded_task_ids
+    ):
+        raise SystemExit("search-specific constraints require the search-decision strategy")
     try:
         provenance, records = _load_records(paths)
         result = select_pivotal_states(
@@ -56,6 +98,9 @@ def main():
             max_states=args.max_states,
             provenance=provenance,
             require_prompt_capture=args.require_prompt_capture,
+            strategy=args.strategy,
+            label_quotas=label_quotas,
+            excluded_task_ids=excluded_task_ids,
         )
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise SystemExit(f"pivotal selection failed: {exc}") from exc

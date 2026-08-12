@@ -17,7 +17,13 @@ from shopping_grpo.training.grpo.pivotal_states import (
 
 PIVOTAL_SELECTION_VERSION = "shopping-pivotal-state-selection-v1"
 PIVOTAL_SELECTION_STRATEGY = "seeded-task-round-robin-v1"
+SEARCH_DECISION_SELECTION_STRATEGY = "seeded-search-decision-stratified-v2"
+SEARCH_DECISION_LABELS = (
+    "search_query_decision",
+    "search_result_open_decision",
+)
 MAX_STATES_PER_TASK = 2
+SEARCH_MAX_STATES_PER_TASK = 1
 PIVOTAL_SELECTION_FIELDS = frozenset(
     {
         "selection_index",
@@ -135,6 +141,7 @@ def _candidate_at(
     trajectory_index: int,
     event_index: int,
     require_prompt_capture: bool,
+    strategy: str = PIVOTAL_SELECTION_STRATEGY,
 ) -> tuple[dict[str, object] | None, str | None]:
     events = trajectory.get("decision_trace")
     if not isinstance(events, list):
@@ -164,7 +171,20 @@ def _candidate_at(
     previous_event = events[event_index - 1] if event_index else None
     if not isinstance(previous_event, Mapping):
         previous_event = None
-    labels = pivotal_labels(accepted_prefix, event, previous_event)
+    if strategy == PIVOTAL_SELECTION_STRATEGY:
+        labels = pivotal_labels(accepted_prefix, event, previous_event)
+    elif strategy == SEARCH_DECISION_SELECTION_STRATEGY:
+        tool = str(event.get("tool") or "")
+        if event.get("accepted") is not True or event.get("error"):
+            labels = ()
+        elif tool == "search_products":
+            labels = ("search_query_decision",)
+        elif tool == "open_product":
+            labels = ("search_result_open_decision",)
+        else:
+            labels = ()
+    else:  # pragma: no cover - public entry points validate this first.
+        raise ValueError("unknown pivotal selection strategy")
     if not labels:
         return None, "not_pivotal"
     if require_prompt_capture:
@@ -233,6 +253,9 @@ def select_pivotal_states(
     max_states: int,
     provenance: Sequence[Mapping[str, object]],
     require_prompt_capture: bool = False,
+    strategy: str = PIVOTAL_SELECTION_STRATEGY,
+    label_quotas: Mapping[str, int] | None = None,
+    excluded_task_ids: Sequence[int] = (),
 ) -> dict[str, object]:
     """Select exact pivotal branches without consulting reward or outcome fields.
 
@@ -250,6 +273,38 @@ def select_pivotal_states(
         raise ValueError("max_states must be a positive integer")
     if not isinstance(require_prompt_capture, bool):
         raise TypeError("require_prompt_capture must be boolean")
+    if strategy not in {
+        PIVOTAL_SELECTION_STRATEGY,
+        SEARCH_DECISION_SELECTION_STRATEGY,
+    }:
+        raise ValueError("unknown pivotal selection strategy")
+    if any(not isinstance(task_id, int) or isinstance(task_id, bool) for task_id in excluded_task_ids):
+        raise TypeError("excluded task ids must be integers")
+    normalized_excluded_task_ids = sorted(set(excluded_task_ids))
+    if any(task_id < 0 for task_id in normalized_excluded_task_ids):
+        raise ValueError("excluded task ids must be non-negative")
+    normalized_label_quotas: dict[str, int] | None = None
+    if strategy == PIVOTAL_SELECTION_STRATEGY:
+        if label_quotas is not None or normalized_excluded_task_ids:
+            raise ValueError("generic pivotal selection does not accept search constraints")
+        max_states_per_task = MAX_STATES_PER_TASK
+    else:
+        if require_prompt_capture is not True:
+            raise ValueError("search-decision selection requires exact prompt capture")
+        if not isinstance(label_quotas, Mapping) or set(label_quotas) != set(
+            SEARCH_DECISION_LABELS
+        ):
+            raise ValueError("search-decision selection requires exact label quotas")
+        normalized_label_quotas = {}
+        for label in SEARCH_DECISION_LABELS:
+            quota = label_quotas.get(label)
+            if not isinstance(quota, int) or isinstance(quota, bool) or quota < 0:
+                raise ValueError("search-decision label quotas must be non-negative integers")
+            normalized_label_quotas[label] = quota
+        if sum(normalized_label_quotas.values()) != max_states:
+            raise ValueError("search-decision label quotas must sum to max_states")
+        max_states_per_task = SEARCH_MAX_STATES_PER_TASK
+    excluded_task_set = set(normalized_excluded_task_ids)
     normalized_provenance = _validate_provenance(provenance)
     unique_candidates: dict[str, dict[str, object]] = {}
     source_records = 0
@@ -291,10 +346,13 @@ def select_pivotal_states(
                     trajectory_index=trajectory_index,
                     event_index=event_index,
                     require_prompt_capture=require_prompt_capture,
+                    strategy=strategy,
                 )
                 if candidate is None:
                     if reason != "not_pivotal":
                         contract_errors[str(reason)] += 1
+                    continue
+                if candidate["task_id"] in excluded_task_set:
                     continue
                 contract_valid_events += 1
                 pivotal_occurrences += 1
@@ -310,42 +368,89 @@ def select_pivotal_states(
                 if _source_rank(candidate) < _source_rank(previous):
                     unique_candidates[branch] = candidate
 
-    by_task: dict[int, list[dict[str, object]]] = defaultdict(list)
-    for candidate in unique_candidates.values():
-        candidate_task_id = candidate["task_id"]
-        if not isinstance(candidate_task_id, int) or isinstance(candidate_task_id, bool):
-            raise TypeError("candidate task_id is not an integer")
-        by_task[candidate_task_id].append(candidate)
-    for task_id, candidates in by_task.items():
-        candidates.sort(
-            key=lambda item: _seeded_rank(seed, f"task:{task_id}:branch", item["branch_uid"])
-        )
-    task_order = sorted(
-        by_task,
-        key=lambda task_id: _seeded_rank(seed, "task", task_id),
-    )
     selected: list[dict[str, object]] = []
-    for task_rank in range(MAX_STATES_PER_TASK):
-        for task_id in task_order:
-            candidates = by_task[task_id]
-            if task_rank >= len(candidates):
-                continue
-            item = dict(candidates[task_rank])
-            item["selection_index"] = len(selected)
-            selected.append(item)
+    if strategy == PIVOTAL_SELECTION_STRATEGY:
+        by_task: dict[int, list[dict[str, object]]] = defaultdict(list)
+        for candidate in unique_candidates.values():
+            candidate_task_id = candidate["task_id"]
+            if not isinstance(candidate_task_id, int) or isinstance(candidate_task_id, bool):
+                raise TypeError("candidate task_id is not an integer")
+            by_task[candidate_task_id].append(candidate)
+        for task_id, candidates in by_task.items():
+            candidates.sort(
+                key=lambda item: _seeded_rank(
+                    seed, f"task:{task_id}:branch", item["branch_uid"]
+                )
+            )
+        task_order = sorted(
+            by_task,
+            key=lambda task_id: _seeded_rank(seed, "task", task_id),
+        )
+        for task_rank in range(MAX_STATES_PER_TASK):
+            for task_id in task_order:
+                candidates = by_task[task_id]
+                if task_rank >= len(candidates):
+                    continue
+                item = dict(candidates[task_rank])
+                item["selection_index"] = len(selected)
+                selected.append(item)
+                if len(selected) >= max_states:
+                    break
             if len(selected) >= max_states:
                 break
-        if len(selected) >= max_states:
-            break
+    else:
+        if normalized_label_quotas is None:  # pragma: no cover - validated above.
+            raise AssertionError("search label quotas were not normalized")
+        selected_tasks: set[int] = set()
+        for label in SEARCH_DECISION_LABELS:
+            by_task = defaultdict(list)
+            for candidate in unique_candidates.values():
+                if candidate["pivotal_labels"] != [label]:
+                    continue
+                by_task[int(candidate["task_id"])].append(candidate)
+            task_order = sorted(
+                by_task,
+                key=lambda task_id: _seeded_rank(seed, f"search-label:{label}:task", task_id),
+            )
+            selected_for_label = 0
+            for task_id in task_order:
+                if task_id in selected_tasks:
+                    continue
+                candidates = sorted(
+                    by_task[task_id],
+                    key=lambda item: _seeded_rank(
+                        seed,
+                        f"search-label:{label}:task:{task_id}:branch",
+                        item["branch_uid"],
+                    ),
+                )
+                item = dict(candidates[0])
+                item["selection_index"] = len(selected)
+                selected.append(item)
+                selected_tasks.add(task_id)
+                selected_for_label += 1
+                if selected_for_label >= normalized_label_quotas[label]:
+                    break
 
     return {
         "schema_version": PIVOTAL_SELECTION_VERSION,
-        "strategy_version": PIVOTAL_SELECTION_STRATEGY,
+        "strategy_version": strategy,
         "seed": seed,
         "constraints": {
             "max_states": max_states,
-            "max_states_per_task": MAX_STATES_PER_TASK,
+            "max_states_per_task": max_states_per_task,
             "require_prompt_capture": require_prompt_capture,
+            **(
+                {
+                    "label_quotas": normalized_label_quotas,
+                    "excluded_task_ids": normalized_excluded_task_ids,
+                    "excluded_task_ids_sha256": hashlib.sha256(
+                        _canonical_json(normalized_excluded_task_ids).encode("utf-8")
+                    ).hexdigest(),
+                }
+                if strategy == SEARCH_DECISION_SELECTION_STRATEGY
+                else {}
+            ),
         },
         "provenance": {"inputs": normalized_provenance},
         "aggregate": {
@@ -381,6 +486,11 @@ _TOP_LEVEL_FIELDS = {
     "selections",
 }
 _CONSTRAINT_FIELDS = {"max_states", "max_states_per_task", "require_prompt_capture"}
+_SEARCH_CONSTRAINT_FIELDS = _CONSTRAINT_FIELDS | {
+    "label_quotas",
+    "excluded_task_ids",
+    "excluded_task_ids_sha256",
+}
 _PROVENANCE_FIELDS = {"inputs"}
 _INPUT_PROVENANCE_FIELDS = {"path", "sha256"}
 _SAFETY_FIELDS = {"outcome_blind", "outcome_fields_read", "uses_hidden_goal"}
@@ -426,19 +536,37 @@ def validate_pivotal_selection(
     _require_exact_fields(selection, _TOP_LEVEL_FIELDS, "selection top-level fields")
     if selection.get("schema_version") != PIVOTAL_SELECTION_VERSION:
         raise ValueError("selection schema_version mismatch")
-    if selection.get("strategy_version") != PIVOTAL_SELECTION_STRATEGY:
+    strategy = selection.get("strategy_version")
+    if strategy not in {
+        PIVOTAL_SELECTION_STRATEGY,
+        SEARCH_DECISION_SELECTION_STRATEGY,
+    }:
         raise ValueError("selection strategy_version mismatch")
     _required_integer(selection.get("seed"), "selection seed")
     constraints = selection.get("constraints")
     if not isinstance(constraints, Mapping):
         raise TypeError("selection constraints must be an object")
-    _require_exact_fields(constraints, _CONSTRAINT_FIELDS, "selection constraints")
+    expected_constraint_fields = (
+        _SEARCH_CONSTRAINT_FIELDS
+        if strategy == SEARCH_DECISION_SELECTION_STRATEGY
+        else _CONSTRAINT_FIELDS
+    )
+    _require_exact_fields(
+        constraints,
+        expected_constraint_fields,
+        "selection constraints",
+    )
     max_states = _required_integer(
         constraints.get("max_states"),
         "selection max_states",
         minimum=1,
     )
-    if constraints.get("max_states_per_task") != MAX_STATES_PER_TASK:
+    expected_task_cap = (
+        SEARCH_MAX_STATES_PER_TASK
+        if strategy == SEARCH_DECISION_SELECTION_STRATEGY
+        else MAX_STATES_PER_TASK
+    )
+    if constraints.get("max_states_per_task") != expected_task_cap:
         raise ValueError("selection max_states_per_task mismatch")
     capture_required = constraints.get("require_prompt_capture")
     if not isinstance(capture_required, bool):
@@ -448,6 +576,33 @@ def validate_pivotal_selection(
             raise TypeError("require_prompt_capture must be boolean")
         if capture_required is not require_prompt_capture:
             raise ValueError("selection require_prompt_capture mismatch")
+    if strategy == SEARCH_DECISION_SELECTION_STRATEGY:
+        if capture_required is not True:
+            raise ValueError("search-decision selection requires exact prompt capture")
+        quotas = constraints.get("label_quotas")
+        if not isinstance(quotas, Mapping) or set(quotas) != set(SEARCH_DECISION_LABELS):
+            raise ValueError("selection search label quotas mismatch")
+        for label in SEARCH_DECISION_LABELS:
+            _required_integer(quotas.get(label), f"selection quota {label}")
+        if sum(int(quotas[label]) for label in SEARCH_DECISION_LABELS) != max_states:
+            raise ValueError("selection search label quotas do not sum to max_states")
+        excluded_task_ids = constraints.get("excluded_task_ids")
+        if (
+            not isinstance(excluded_task_ids, list)
+            or any(
+                not isinstance(task_id, int)
+                or isinstance(task_id, bool)
+                or task_id < 0
+                for task_id in excluded_task_ids
+            )
+            or excluded_task_ids != sorted(set(excluded_task_ids))
+        ):
+            raise ValueError("selection excluded task ids are invalid")
+        expected_excluded_sha256 = hashlib.sha256(
+            _canonical_json(excluded_task_ids).encode("utf-8")
+        ).hexdigest()
+        if constraints.get("excluded_task_ids_sha256") != expected_excluded_sha256:
+            raise ValueError("selection excluded task id hash mismatch")
     provenance = selection.get("provenance")
     if not isinstance(provenance, Mapping):
         raise TypeError("selection provenance must be an object")
@@ -516,6 +671,10 @@ def validate_pivotal_selection(
             or labels != sorted(set(labels))
         ):
             raise ValueError(f"selection {expected_index} has invalid pivotal_labels")
+        if strategy == SEARCH_DECISION_SELECTION_STRATEGY and labels not in [
+            [label] for label in SEARCH_DECISION_LABELS
+        ]:
+            raise ValueError(f"selection {expected_index} is not a search decision")
         source = raw_item.get("source")
         if not isinstance(source, Mapping):
             raise TypeError(f"selection {expected_index} source must be an object")
@@ -546,7 +705,7 @@ def validate_pivotal_selection(
         if not isinstance(source.get("uid"), str):
             raise TypeError(f"selection {expected_index} source uid must be a string")
         task_counts[task_id] += 1
-        if task_counts[task_id] > MAX_STATES_PER_TASK:
+        if task_counts[task_id] > expected_task_cap:
             raise ValueError(f"selection exceeds task cap for task {task_id}")
         validated.append(
             {
@@ -589,6 +748,11 @@ def validate_pivotal_selection(
         raise ValueError("selection aggregate branch deduplication mismatch")
     if len(validated) > aggregate["unique_branch_candidates"]:
         raise ValueError("selection aggregate has fewer candidates than selections")
+    if strategy == SEARCH_DECISION_SELECTION_STRATEGY:
+        quotas = constraints["label_quotas"]
+        selected_label_counts = Counter(item["pivotal_labels"][0] for item in validated)
+        if any(selected_label_counts[label] > quotas[label] for label in SEARCH_DECISION_LABELS):
+            raise ValueError("selection exceeds a search decision label quota")
     return validated
 
 
@@ -611,6 +775,7 @@ def resolve_pivotal_selection(
     constraints = selection["constraints"]
     if not isinstance(constraints, Mapping):  # pragma: no cover - validated above.
         raise TypeError("validated selection constraints are not an object")
+    strategy = str(selection.get("strategy_version") or "")
     recomputed = select_pivotal_states(
         record_list,
         seed=_required_integer(selection.get("seed"), "selection seed"),
@@ -621,6 +786,17 @@ def resolve_pivotal_selection(
         ),
         provenance=expected_inputs,
         require_prompt_capture=bool(constraints["require_prompt_capture"]),
+        strategy=strategy,
+        label_quotas=(
+            constraints.get("label_quotas")
+            if strategy == SEARCH_DECISION_SELECTION_STRATEGY
+            else None
+        ),
+        excluded_task_ids=(
+            constraints.get("excluded_task_ids", [])
+            if strategy == SEARCH_DECISION_SELECTION_STRATEGY
+            else ()
+        ),
     )
     if _canonical_json(dict(selection)) != _canonical_json(recomputed):
         raise ValueError("selection does not match the deterministic outcome-blind selector")
@@ -662,6 +838,7 @@ def resolve_pivotal_selection(
             trajectory_index=trajectory_index,
             event_index=int(source["event_index"]),
             require_prompt_capture=bool(constraints["require_prompt_capture"]),
+            strategy=strategy,
         )
         if candidate is None:
             raise ValueError(f"selected event rejected at {locator}: {reason}")

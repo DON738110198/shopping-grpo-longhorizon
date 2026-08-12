@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import sys
@@ -28,6 +29,7 @@ from shopping_grpo.training.grpo.pivotal_states import (
     token_ids_sha256,
 )
 from shopping_grpo.training.grpo.selection import (
+    SEARCH_DECISION_SELECTION_STRATEGY,
     resolve_pivotal_selection,
     select_pivotal_states,
     validate_pivotal_selection,
@@ -245,6 +247,94 @@ def active_decoding_config() -> dict[str, object]:
 
 
 class PivotalSelectionTest(unittest.TestCase):
+    def test_search_decision_selector_is_stratified_fresh_and_outcome_blind(self):
+        rows = [
+            (
+                0,
+                "/audit.jsonl",
+                task_id,
+                record(
+                    task_id,
+                    [OutcomePoison(exact_trajectory(task_id, task_id, capture_prompts=True))],
+                ),
+            )
+            for task_id in range(1, 7)
+        ]
+
+        result = select_pivotal_states(
+            rows,
+            seed=20260812,
+            max_states=4,
+            provenance=PROVENANCE,
+            require_prompt_capture=True,
+            strategy=SEARCH_DECISION_SELECTION_STRATEGY,
+            label_quotas={
+                "search_query_decision": 2,
+                "search_result_open_decision": 2,
+            },
+            excluded_task_ids=[1, 2],
+        )
+
+        self.assertEqual(len(result["selections"]), 4)
+        self.assertEqual(len({item["task_id"] for item in result["selections"]}), 4)
+        self.assertFalse({1, 2} & {item["task_id"] for item in result["selections"]})
+        self.assertEqual(
+            Counter(item["pivotal_labels"][0] for item in result["selections"]),
+            {"search_query_decision": 2, "search_result_open_decision": 2},
+        )
+        self.assertEqual(result["constraints"]["max_states_per_task"], 1)
+        self.assertEqual(result["constraints"]["excluded_task_ids"], [1, 2])
+        self.assertTrue(result["safety"]["outcome_blind"])
+        resolved = resolve_pivotal_selection(
+            result,
+            rows,
+            expected_inputs=PROVENANCE,
+            require_prompt_capture=True,
+        )
+        self.assertEqual(len(resolved), 4)
+        plan = build_active_branch_plan(
+            resolved,
+            actor_checkpoint_sha256="e" * 64,
+            decoding_config=active_decoding_config(),
+            seed=20260812,
+            suffixes_per_state=4,
+        )
+        self.assertEqual(validate_active_branch_plan(plan), plan)
+
+    def test_search_decision_selector_rejects_constraint_tampering(self):
+        rows = [
+            (
+                0,
+                "/audit.jsonl",
+                task_id,
+                record(task_id, [exact_trajectory(task_id, task_id, capture_prompts=True)]),
+            )
+            for task_id in range(1, 5)
+        ]
+        result = select_pivotal_states(
+            rows,
+            seed=20260812,
+            max_states=2,
+            provenance=PROVENANCE,
+            require_prompt_capture=True,
+            strategy=SEARCH_DECISION_SELECTION_STRATEGY,
+            label_quotas={
+                "search_query_decision": 1,
+                "search_result_open_decision": 1,
+            },
+            excluded_task_ids=[9],
+        )
+
+        bad_hash = copy.deepcopy(result)
+        bad_hash["constraints"]["excluded_task_ids_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "excluded task id hash"):
+            validate_pivotal_selection(bad_hash, expected_inputs=PROVENANCE)
+
+        bad_quota = copy.deepcopy(result)
+        bad_quota["constraints"]["label_quotas"]["search_query_decision"] = 2
+        with self.assertRaisesRegex(ValueError, "do not sum"):
+            validate_pivotal_selection(bad_quota, expected_inputs=PROVENANCE)
+
     def test_selector_cli_writes_hashed_exact_source_locators(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
