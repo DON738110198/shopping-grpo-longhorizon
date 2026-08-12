@@ -438,3 +438,38 @@ state 提供更稳定的局部排序信号。候选标签仅由当前 Observatio
 只有 `structural_ready=true`、`signal_ready=true`、`training_ready=true` 且
 `optimizer_unlock_allowed=true` 同时成立，才讨论独立的 actor-only 训练 smoke；否则仍不调用
 optimizer，也不评测 Final-200。
+
+## Search-decision selector v2 确认结果
+
+固定提交 `d88d5a3` 按上述协议完成 fresh confirmation：capture seed `3408` 产生 100 个
+unique task / 400 条 rollout / 5,098 个 exact prompt capture，3/100 group 为
+sampling-invalid，infrastructure-invalid 为 0；全程 optimizer update 和 checkpoint 均为 0。
+排除旧 Formal N80 的 80 个 task 后，selector 精确选择 40 个 query state + 40 个 open
+state，覆盖 80 个新 task，public live replay 为 80/80。Stage 1 的 320/320 proposal 全部
+结构有效；Nested Stage 2 完成 275 个 distinct decision x 8，共 2,200 条 continuation，
+其中 64 条 `reward_unverifiable`，infrastructure-invalid 为 0，fresh lease / verified release
+均为 2,200/2,200。
+
+工程与 structural gate 通过，但 signal gate 仍按预注册规则失败：
+
+| Signal gate | 观测值 | 门槛 | 结果 |
+| --- | ---: | ---: | --- |
+| high-kappa state rate | 31.88% | >= 30% | PASS |
+| gate-fold top-bottom mean delta | +0.1728 | >= +0.10 | PASS |
+| split-half ranking consistency | 57.41% | >= 60% | FAIL |
+| mean-delta bootstrap 95% CI | [+0.0756, +0.2774] | lower > 0 | PASS |
+| consistency bootstrap 95% CI | [44.44%, 70.37%] | lower > 50% | FAIL |
+| task-cluster permutation p | 0.00070 | observed > null p95 | PASS |
+
+因此结果为 `structural_ready=true`、`signal_ready=false`、`training_ready=false`、
+`optimizer_unlock_allowed=false`。相较通用 pivotal selector，search-decision v2 显著提高了
+held-out delta，但排序方向仍不够稳定，本轮仍不训练、不评测 Final-200。
+
+标签分层仅作事后假设生成：query state 的 28 个 identifiable state 上，held-out mean
+delta 为 `+0.1958`、consistency 为 `67.86%`；open state 的对应结果为 26 个、`+0.1481`
+和 `46.15%`。这不能把当前 query 子集改判为通过，只支持下一轮独立检验 query-only 假设。
+
+下一轮预注册为新 seed `3409` 的 60-step capture-only collection，排除前两轮全部 160 个
+task；selector seed 固定为 `20260814`，只选择 80 个 `search_query_decision`，每 task 一个
+state。任一 quota 不足即停止，不追加、不替换；Stage 1 仍为 K=4，Nested 仍为 L=8，所有
+structural/signal gate 与本轮完全相同。GPU 不可用时不抢占或终止其他任务。
