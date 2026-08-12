@@ -409,3 +409,32 @@ post-action boundary 的 decision，15 条 reward-invalid 为 `reward_unverifiab
 但 held-out mean delta 仅 `+0.0429`；11 个 `pre_commit` state 没有可识别的 decision 排序。
 后续若继续，应在新的独立任务上预注册更接近真实分叉点的公开状态，例如搜索页上的 query/open
 决策，而不是根据本轮 outcome 挑选通过的 state 或放宽统计门槛。
+
+## Search-decision selector v2 预注册
+
+下一轮只检验一个在 Formal N80 之后提出的新假设：更接近真实检索分叉点的公开
+`search_products` 和 `open_product` decision，是否比通用 `candidate_open` / `pre_commit`
+state 提供更稳定的局部排序信号。候选标签仅由当前 Observation v2 可见动作及其 accepted
+状态决定，不读取 terminal reward、strict、utility、goal 或后续 suffix outcome。
+
+在旧 N80 capture 上的事后可行性检查只用于确认样本量与 replay 能力，不作为确认性证据：
+共有 1,175 个符合条件的 search-decision occurrence、861 个 unique branch；固定选择的
+40 个 query state + 40 个 open state 覆盖 80 个 unique task，public live replay 为 80/80。
+
+确认性实验固定如下，不根据运行结果修改：
+
+- fixed-policy capture 使用新 seed `3408`，运行 50 个 capture-only step；不更新 optimizer，
+  不保存 checkpoint。
+- 排除 Formal N80 已使用的全部 80 个 task；selector seed 固定为 `20260813`。
+- 使用 `seeded-search-decision-stratified-v2`，精确选择 40 个 `search_query_decision` 与
+  40 个 `search_result_open_decision`，每个 task 最多一个 state，且必须具备 exact prompt capture。
+- 任一 quota 不足即停止；不自适应追加 task、不按 reward 补采或替换 state。
+- Stage 1 固定每 state 采 4 个 first-decision proposal；Nested Stage 2 对每个 distinct
+  decision 固定 8 个 continuation，其中 train/gate fold 各 4 个。
+- Structural 与 signal gate 沿用 Formal N80 的预注册阈值：high-kappa rate >= 30%、
+  held-out mean delta >= 0.10、split-half consistency >= 60%，同时要求对应 task-cluster
+  bootstrap 下界和 permutation gate 通过；不得事后放宽。
+
+只有 `structural_ready=true`、`signal_ready=true`、`training_ready=true` 且
+`optimizer_unlock_allowed=true` 同时成立，才讨论独立的 actor-only 训练 smoke；否则仍不调用
+optimizer，也不评测 Final-200。
