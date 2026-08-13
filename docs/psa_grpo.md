@@ -473,3 +473,36 @@ delta 为 `+0.1958`、consistency 为 `67.86%`；open state 的对应结果为 2
 task；selector seed 固定为 `20260814`，只选择 80 个 `search_query_decision`，每 task 一个
 state。任一 quota 不足即停止，不追加、不替换；Stage 1 仍为 K=4，Nested 仍为 L=8，所有
 structural/signal gate 与本轮完全相同。GPU 不可用时不抢占或终止其他任务。
+
+## Query-only 独立确认结果
+
+第三轮按上述预注册协议完成。fresh capture seed `3409` 共运行 60 个 capture-only step，得到
+120 个 unique task / 480 条 rollout / 6,291 个 exact prompt capture；3/120 group 为
+sampling-invalid，infrastructure-invalid 为 0，optimizer update 与 checkpoint 均为 0。原
+selector 对 quota 为 0 的标签仍会先选一条再停止，已在提交 `75ec92d` 修复并增加 fail-closed
+回归；修复后精确选择 80 个 `search_query_decision`、0 个 open state，覆盖 80 个新 task，
+public live replay 为 80/80。
+
+Stage 1 的 320/320 proposal 全部结构有效。Nested Stage 2 完成 243 个 distinct decision x 8，
+共 1,944 条 continuation；其中 5 条 `reward_unverifiable`，infrastructure-invalid 为 0，fresh
+lease / verified release 均为 1,944/1,944。68 个 state / task 满足 credit structural contract，
+state 与 task-cluster ESS 均为 68，因此 structural gate 通过。
+
+预注册 signal gate 六项全部失败：
+
+| Signal gate | 观测值 | 门槛 | 结果 |
+| --- | ---: | ---: | --- |
+| high-kappa state rate | 29.41% (20/68) | >= 30% | FAIL |
+| gate-fold top-bottom mean delta | +0.0322 | >= +0.10 | FAIL |
+| split-half ranking consistency | 46.81% (22/47) | >= 60% | FAIL |
+| mean-delta bootstrap 95% CI | [-0.0477, +0.1207] | lower > 0 | FAIL |
+| consistency bootstrap 95% CI | [31.91%, 61.70%] | lower > 50% | FAIL |
+| task-cluster permutation p | 0.2369; observed 0.0322 < null p95 0.0700 | observed > null p95 | FAIL |
+
+最终为 `structural_ready=true`、`signal_ready=false`、`training_ready=false`、
+`optimizer_unlock_allowed=false`。完整 artifact adapter 的第二次独立重算与原 report 字节一致，
+SHA256 均为 `d4655aa799c461d95a8eaec935f62d7208be433a4420fc86c28168b87c1a024a`。
+因此 query-only 假设在新的独立任务上未得到确认；本轮没有调用 optimizer，也没有评测
+Final-200。连续三轮确认性实验均未通过预注册 signal gate 后，不再继续按 outcome 或标签切分
+来寻找可训练子集；后续工作应转向更强的 credit estimator / intervention design，或将该结果作为
+负结果与系统性审计证据报告。
