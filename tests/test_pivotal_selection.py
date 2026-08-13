@@ -335,6 +335,49 @@ class PivotalSelectionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "do not sum"):
             validate_pivotal_selection(bad_quota, expected_inputs=PROVENANCE)
 
+    def test_search_decision_selector_honors_zero_quota_and_requires_exact_fill(self):
+        rows = [
+            (
+                0,
+                "/audit.jsonl",
+                task_id,
+                record(task_id, [exact_trajectory(task_id, task_id, capture_prompts=True)]),
+            )
+            for task_id in range(1, 4)
+        ]
+        query_only = select_pivotal_states(
+            rows,
+            seed=20260814,
+            max_states=2,
+            provenance=PROVENANCE,
+            require_prompt_capture=True,
+            strategy=SEARCH_DECISION_SELECTION_STRATEGY,
+            label_quotas={
+                "search_query_decision": 2,
+                "search_result_open_decision": 0,
+            },
+        )
+
+        self.assertEqual(len(query_only["selections"]), 2)
+        self.assertEqual(
+            Counter(item["pivotal_labels"][0] for item in query_only["selections"]),
+            {"search_query_decision": 2},
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot fill search decision quota"):
+            select_pivotal_states(
+                rows[:1],
+                seed=20260814,
+                max_states=2,
+                provenance=PROVENANCE,
+                require_prompt_capture=True,
+                strategy=SEARCH_DECISION_SELECTION_STRATEGY,
+                label_quotas={
+                    "search_query_decision": 2,
+                    "search_result_open_decision": 0,
+                },
+            )
+
     def test_selector_cli_writes_hashed_exact_source_locators(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

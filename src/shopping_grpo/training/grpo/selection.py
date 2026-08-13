@@ -403,6 +403,9 @@ def select_pivotal_states(
             raise AssertionError("search label quotas were not normalized")
         selected_tasks: set[int] = set()
         for label in SEARCH_DECISION_LABELS:
+            quota = normalized_label_quotas[label]
+            if quota == 0:
+                continue
             by_task = defaultdict(list)
             for candidate in unique_candidates.values():
                 if candidate["pivotal_labels"] != [label]:
@@ -429,8 +432,13 @@ def select_pivotal_states(
                 selected.append(item)
                 selected_tasks.add(task_id)
                 selected_for_label += 1
-                if selected_for_label >= normalized_label_quotas[label]:
+                if selected_for_label >= quota:
                     break
+            if selected_for_label != quota:
+                raise ValueError(
+                    "cannot fill search decision quota "
+                    f"for {label}: requested {quota}, found {selected_for_label}"
+                )
 
     return {
         "schema_version": PIVOTAL_SELECTION_VERSION,
